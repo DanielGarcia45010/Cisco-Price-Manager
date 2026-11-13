@@ -1,289 +1,746 @@
+
+import os
 import io
-from datetime import datetime
+import json
+import time
+import requests
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
-from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.table import Table, TableStyleInfo
+from datetime import datetime
 
-st.set_page_config(page_title="Cisco Price Manager", page_icon="📊", layout="wide")
+# ============================================================
+# CONFIGURACION
+# ============================================================
 
-HEADERS = [
-    "Part Number", "Smart Account Mandatory", "Description",
-    "Service Duration (Months)", "Estimated Lead Time (Days)",
-    "Unit List Price", "Pricing Term", "Qty", "Unit Net Price",
-    "Disc(%)", "Extended Net Price"
-]
+st.set_page_config(
+    page_title="Cisco Price Manager",
+    page_icon="🌐",
+    layout="wide"
+)
 
-def as_number(value, default=0.0):
-    try:
-        if value is None or value == "":
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+TOKEN_URL = "https://id.cisco.com/oauth2/default/v1/token"
 
-def parse_cisco_quote(file):
-    wb = load_workbook(file, data_only=True)
-    ws = wb[wb.sheetnames[0]]
-    header_row = None
-    for r in range(1, min(ws.max_row, 60) + 1):
-        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
-        if "Part Number" in vals and "Unit List Price" in vals:
-            header_row = r
-            break
-    if header_row is None:
-        raise ValueError("No encontré la fila de encabezados de una cotización Cisco.")
+# No se inventa el endpoint GraphQL.
+# Se debe configurar con la URL exacta indicada por Cisco
+# para la aplicación y entorno que hayan sido aprobados.
 
-    colmap = {}
-    for c in range(1, ws.max_column + 1):
-        v = ws.cell(header_row, c).value
-        if v in HEADERS:
-            colmap[v] = c
+CLIENT_ID = os.getenv("CISCO_CLIENT_ID", "")
+CLIENT_SECRET = os.getenv("CISCO_CLIENT_SECRET", "")
+GRAPHQL_URL = os.getenv("CISCO_GRAPHQL_URL", "")
 
-    rows = []
-    for r in range(header_row + 1, ws.max_row + 1):
-        sku = ws.cell(r, colmap["Part Number"]).value if "Part Number" in colmap else None
+PRICE_QUERY = os.getenv("CISCO_PRICE_QUERY", "")
+VARIABLES_TEMPLATE = os.getenv(
+    "CISCO_PRICE_VARIABLES_TEMPLATE", ""
+)
+PRICE_JSON_PATH = os.getenv("CISCO_PRICE_JSON_PATH", "")
+
+# ============================================================
+# ESTILOS
+# ============================================================
+
+st.title("🌐 Cisco Price Manager")
+st.caption(
+    "Administración y actualización de precios de productos Cisco"
+)
+
+# ============================================================
+# AUTENTICACION CISCO
+# ============================================================
+
+def get_cisco_token():
+
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise ValueError(
+            "Faltan CISCO_CLIENT_ID o CISCO_CLIENT_SECRET."
+        )
+
+    response = requests.post(
+        TOKEN_URL,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json"
+        },
+        data={
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET
+        },
+        timeout=30
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Error de autenticación Cisco: HTTP "
+            f"{response.status_code}. "
+            "Revisa el registro y los permisos de la aplicación."
+        )
+
+    data = response.json()
+
+    token = data.get("access_token")
+
+    if not token:
+        raise RuntimeError(
+            "Cisco no devolvió un access_token."
+        )
+
+    return token
+
+
+# ============================================================
+# FUNCIONES GRAPHQL
+# ============================================================
+
+def get_json_path(data, path):
+
+    """
+    Lee un campo anidado de una respuesta JSON.
+
+    Ejemplo:
+    data.catalog.product.listPrice
+    """
+
+    current = data
+
+    for part in path.split("."):
+
+        if isinstance(current, list):
+            current = current[int(part)]
+
+        elif isinstance(current, dict):
+            current = current[part]
+
+        else:
+            raise KeyError(
+                f"No se encontró la ruta: {path}"
+            )
+
+    return current
+
+
+def query_cisco_price(sku, token):
+
+    """
+    Consulta un SKU mediante la operación GraphQL
+    configurada con la documentación oficial de Cisco.
+
+    La consulta, variables y ruta de respuesta deben
+    corresponder exactamente al esquema autorizado.
+    """
+
+    if not GRAPHQL_URL:
+        raise ValueError(
+            "No está configurado CISCO_GRAPHQL_URL."
+        )
+
+    if not PRICE_QUERY:
+        raise ValueError(
+            "No está configurado CISCO_PRICE_QUERY."
+        )
+
+    if not VARIABLES_TEMPLATE:
+        raise ValueError(
+            "No está configurado "
+            "CISCO_PRICE_VARIABLES_TEMPLATE."
+        )
+
+    if not PRICE_JSON_PATH:
+        raise ValueError(
+            "No está configurado CISCO_PRICE_JSON_PATH."
+        )
+
+    variables_text = VARIABLES_TEMPLATE.replace(
+        "{{SKU}}", sku
+    )
+
+    variables = json.loads(variables_text)
+
+    response = requests.post(
+        GRAPHQL_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        },
+        json={
+            "query": PRICE_QUERY,
+            "variables": variables
+        },
+        timeout=45
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Error Cisco HTTP {response.status_code}"
+        )
+
+    result = response.json()
+
+    if result.get("errors"):
+        raise RuntimeError(
+            "Cisco devolvió errores GraphQL: "
+            + json.dumps(result["errors"], ensure_ascii=False)
+        )
+
+    price = get_json_path(
+        result,
+        PRICE_JSON_PATH
+    )
+
+    if price is None:
+        raise ValueError(
+            "Cisco no devolvió un precio."
+        )
+
+    price = float(price)
+
+    if price < 0:
+        raise ValueError(
+            "El precio devuelto no es válido."
+        )
+
+    return price
+
+
+# ============================================================
+# LECTURA DE COTIZACION
+# ============================================================
+
+def find_header_row(workbook):
+
+    ws = workbook.active
+
+    for row_number in range(1, 40):
+
+        values = [
+            str(cell.value).strip()
+            if cell.value is not None else ""
+            for cell in ws[row_number]
+        ]
+
+        if (
+            "Part Number" in values
+            and "Unit List Price" in values
+        ):
+            return row_number
+
+    raise ValueError(
+        "No se encontró la fila de encabezados "
+        "de la cotización Cisco."
+    )
+
+
+def load_quote(file_bytes):
+
+    workbook = load_workbook(
+        io.BytesIO(file_bytes)
+    )
+
+    ws = workbook.active
+
+    header_row = find_header_row(workbook)
+
+    headers = {}
+
+    for column in range(1, ws.max_column + 1):
+
+        value = ws.cell(
+            header_row,
+            column
+        ).value
+
+        if value is not None:
+            headers[str(value).strip()] = column
+
+    required = [
+        "Part Number",
+        "Unit List Price",
+        "Unit Net Price",
+        "Disc(%)",
+        "Qty",
+        "Extended Net Price"
+    ]
+
+    missing = [
+        field for field in required
+        if field not in headers
+    ]
+
+    if missing:
+        raise ValueError(
+            "Faltan columnas requeridas: "
+            + ", ".join(missing)
+        )
+
+    records = []
+
+    for row in range(header_row + 1, ws.max_row + 1):
+
+        sku = ws.cell(
+            row,
+            headers["Part Number"]
+        ).value
+
         if not sku:
             continue
-        row = {}
-        for h in HEADERS:
-            c = colmap.get(h)
-            row[h] = ws.cell(r, c).value if c else None
-        row["Part Number"] = str(row["Part Number"]).strip()
-        row["Unit List Price"] = as_number(row["Unit List Price"])
-        row["Qty"] = as_number(row["Qty"], 1)
-        row["Disc(%)"] = as_number(row["Disc(%)"])
-        row["Unit Net Price"] = round(row["Unit List Price"] * (1 - row["Disc(%)"] / 100), 2)
-        row["Extended Net Price"] = round(row["Unit Net Price"] * row["Qty"], 2)
-        rows.append(row)
 
-    meta = {
-        "Customer": ws["A3"].value,
-        "Quote Date": ws["A10"].value,
-        "Estimate ID": ws["K10"].value,
-        "Deal ID": ws["K11"].value,
-        "Price List": ws["K12"].value,
-    }
-    return pd.DataFrame(rows, columns=HEADERS), meta
+        record = {
+            "Excel Row": row,
+            "Part Number": str(sku).strip()
+        }
 
-def normalize_df(df):
-    for col in HEADERS:
-        if col not in df.columns:
-            df[col] = None
-    df = df[HEADERS].copy()
-    df["Part Number"] = df["Part Number"].fillna("").astype(str).str.strip()
-    for col in ["Unit List Price", "Qty", "Disc(%)"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    df["Qty"] = df["Qty"].replace(0, 1)
-    df["Unit Net Price"] = (df["Unit List Price"] * (1 - df["Disc(%)"] / 100)).round(2)
-    df["Extended Net Price"] = (df["Unit Net Price"] * df["Qty"]).round(2)
-    return df[df["Part Number"] != ""].reset_index(drop=True)
+        for field in headers:
 
-def classify(row):
-    sku = str(row["Part Number"]).upper()
-    desc = str(row["Description"] or "").lower()
-    if sku.startswith("CON-") or "support" in desc or "maintenance" in desc:
-        return "Service"
-    if "subscription" in desc:
-        return "Subscription"
-    return "Product"
+            if field == "Part Number":
+                continue
 
-def export_quote(df, meta, currency):
-    df = normalize_df(df)
-    out = io.BytesIO()
-    from openpyxl import Workbook
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Price Estimate"
+            record[field] = ws.cell(
+                row,
+                headers[field]
+            ).value
 
-    ws["A1"] = "Price Estimate"
-    ws["A1"].font = Font(size=18, bold=True, color="FFFFFF")
-    ws["A1"].fill = PatternFill("solid", fgColor="17365D")
-    ws.merge_cells("A1:K1")
+        records.append(record)
 
-    ws["A3"] = meta.get("Customer") or "Customer"
-    ws["A3"].font = Font(bold=True, size=12)
-    ws["A9"] = "Price Estimate for planning and information purposes only; not a binding offer from Cisco."
-    ws.merge_cells("A9:K9")
-    ws["A10"] = "Date:"
-    ws["B10"] = datetime.now().strftime("%d-%b-%Y")
-    ws["I10"] = "Estimate ID:"
-    ws["K10"] = meta.get("Estimate ID") or "Internal"
-    ws["I11"] = "Deal ID:"
-    ws["K11"] = meta.get("Deal ID") or "NA"
-    ws["I12"] = "Price List:"
-    ws["K12"] = meta.get("Price List") or "User supplied / pending Cisco validation"
-    ws["A13"] = f"All prices are shown in {currency}"
+    df = pd.DataFrame(records)
 
-    header_row = 14
-    for c, h in enumerate(HEADERS, 1):
-        cell = ws.cell(header_row, c, h)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="1F4E78")
-        cell.alignment = Alignment(wrap_text=True, vertical="center")
+    if df.empty:
+        raise ValueError(
+            "La cotización no contiene SKU."
+        )
 
-    for i, (_, row) in enumerate(df.iterrows(), header_row + 1):
-        values = [row[h] for h in HEADERS]
-        for c, value in enumerate(values, 1):
-            ws.cell(i, c, value)
-        for c in [6, 9, 11]:
-            ws.cell(i, c).number_format = f'"{currency}" #,##0.00'
-        ws.cell(i, 10).number_format = '0.00"%"'
-        ws.cell(i, 8).number_format = '0.##'
+    return workbook, df, headers, header_row
 
-    end_row = header_row + len(df)
-    summary_row = end_row + 2
-    categories = {"Product": 0.0, "Service": 0.0, "Subscription": 0.0}
-    for _, row in df.iterrows():
-        categories[classify(row)] += float(row["Extended Net Price"])
-    for offset, (label, value) in enumerate([
-        ("Product Total", categories["Product"]),
-        ("Service Total", categories["Service"]),
-        ("Subscription Total", categories["Subscription"]),
-        ("Total Price", sum(categories.values()))
-    ]):
-        rr = summary_row + offset
-        ws.cell(rr, 9, label).font = Font(bold=True)
-        ws.cell(rr, 11, round(value, 2)).font = Font(bold=True)
-        ws.cell(rr, 11).number_format = f'"{currency}" #,##0.00'
-        if label == "Total Price":
-            ws.cell(rr, 9).fill = PatternFill("solid", fgColor="D9EAF7")
-            ws.cell(rr, 11).fill = PatternFill("solid", fgColor="D9EAF7")
 
-    widths = [25, 24, 65, 20, 23, 18, 18, 10, 18, 12, 22]
-    for idx, width in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(idx)].width = width
-    ws.freeze_panes = "A15"
-    ws.auto_filter.ref = f"A{header_row}:K{end_row}"
-    ws.row_dimensions[header_row].height = 34
-    thin = Side(style="thin", color="D9E2F3")
-    for row in ws.iter_rows(min_row=header_row, max_row=end_row, min_col=1, max_col=11):
-        for cell in row:
-            cell.border = Border(bottom=thin)
-            if cell.row > header_row:
-                cell.alignment = Alignment(vertical="top", wrap_text=True)
-    wb.save(out)
-    out.seek(0)
-    return out
+# ============================================================
+# ACTUALIZACION DE PRECIOS
+# ============================================================
 
-st.title("Cisco Price Manager")
-st.caption("Gestión de cotizaciones, descuentos manuales y comparación de precios Cisco")
+def refresh_prices(df):
+
+    df = df.copy()
+
+    token = get_cisco_token()
+
+    unique_skus = (
+        df["Part Number"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+    price_results = {}
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    for index, sku in enumerate(unique_skus):
+
+        status.write(
+            f"Consultando Cisco: {sku}"
+        )
+
+        try:
+
+            price = query_cisco_price(
+                sku,
+                token
+            )
+
+            price_results[sku] = {
+                "price": price,
+                "status": "Actualizado",
+                "error": ""
+            }
+
+        except Exception as error:
+
+            price_results[sku] = {
+                "price": None,
+                "status": "Sin actualizar",
+                "error": str(error)
+            }
+
+        progress.progress(
+            (index + 1) / len(unique_skus)
+        )
+
+        time.sleep(0.1)
+
+    status.success(
+        "Finalizó la consulta de SKU."
+    )
+
+    df["Cisco List Price"] = df["Part Number"].map(
+        lambda sku: price_results.get(
+            str(sku),
+            {}
+        ).get("price")
+    )
+
+    df["Cisco Status"] = df["Part Number"].map(
+        lambda sku: price_results.get(
+            str(sku),
+            {}
+        ).get("status", "Sin consultar")
+    )
+
+    df["Cisco Error"] = df["Part Number"].map(
+        lambda sku: price_results.get(
+            str(sku),
+            {}
+        ).get("error", "")
+    )
+
+    # Solo reemplazar precios cuando Cisco devuelve
+    # un valor válido. Los descuentos se conservan.
+
+    for index, row in df.iterrows():
+
+        new_price = row["Cisco List Price"]
+
+        if pd.notna(new_price):
+
+            discount = pd.to_numeric(
+                row.get("Disc(%)", 0),
+                errors="coerce"
+            )
+
+            quantity = pd.to_numeric(
+                row.get("Qty", 1),
+                errors="coerce"
+            )
+
+            discount = (
+                0 if pd.isna(discount) else discount
+            )
+
+            quantity = (
+                1 if pd.isna(quantity) else quantity
+            )
+
+            net_price = new_price * (
+                1 - discount / 100
+            )
+
+            df.at[index, "Unit List Price"] = new_price
+            df.at[index, "Unit Net Price"] = net_price
+            df.at[index, "Extended Net Price"] = (
+                net_price * quantity
+            )
+
+    df["Last Updated"] = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    return df
+
+
+# ============================================================
+# EXPORTAR EXCEL
+# ============================================================
+
+def export_quote(
+    workbook,
+    df,
+    headers,
+    header_row
+):
+
+    ws = workbook.active
+
+    for _, record in df.iterrows():
+
+        excel_row = int(record["Excel Row"])
+
+        for field in [
+            "Unit List Price",
+            "Unit Net Price",
+            "Extended Net Price"
+        ]:
+
+            if field in headers:
+
+                value = record.get(field)
+
+                if pd.notna(value):
+
+                    ws.cell(
+                        excel_row,
+                        headers[field]
+                    ).value = float(value)
+
+    output = io.BytesIO()
+
+    workbook.save(output)
+
+    output.seek(0)
+
+    return output.getvalue()
+
+
+# ============================================================
+# INTERFAZ
+# ============================================================
 
 with st.sidebar:
-    st.header("Configuración")
-    currency = st.selectbox("Moneda", ["USD", "COP", "EUR"], index=0)
-    st.info("Los descuentos se ingresan manualmente por SKU. Los precios no se consultan todavía en Cisco.")
-    st.markdown("**Estado de integración**")
-    st.warning("Cisco API: pendiente de autorización y configuración")
 
-tab_quote, tab_skus, tab_compare = st.tabs(["Cotización desde Excel", "Consulta de SKU", "Comparar precios"])
+    st.header("Conexión Cisco")
 
-if "data" not in st.session_state:
-    st.session_state.data = pd.DataFrame(columns=HEADERS)
-if "meta" not in st.session_state:
-    st.session_state.meta = {}
+    if CLIENT_ID and CLIENT_SECRET:
 
-with tab_quote:
-    st.subheader("Importar una cotización Cisco")
-    uploaded = st.file_uploader("Selecciona el archivo Excel de Cisco (.xlsx)", type=["xlsx"], key="quote_upload")
-    if uploaded is not None:
-        try:
-            data, meta = parse_cisco_quote(uploaded)
-            st.session_state.data = data
-            st.session_state.meta = meta
-            st.success(f"Se importaron {len(data)} líneas de producto.")
-        except Exception as e:
-            st.error(f"No pude leer la cotización: {e}")
+        st.success(
+            "Credenciales configuradas"
+        )
 
-    if not st.session_state.data.empty:
-        meta = st.session_state.meta
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Cliente", str(meta.get("Customer") or "No indicado"))
-        c2.metric("Estimate ID", str(meta.get("Estimate ID") or "No indicado"))
-        c3.metric("SKU / líneas", len(st.session_state.data))
+    else:
 
-        st.markdown("#### Edita cantidades, precios de lista y descuentos")
-        st.caption("Los precios netos y extendidos se recalculan automáticamente al exportar.")
-        edited = st.data_editor(
-            st.session_state.data,
+        st.warning(
+            "Faltan credenciales OAuth"
+        )
+
+    if GRAPHQL_URL and PRICE_QUERY:
+
+        st.success(
+            "Consulta GraphQL configurada"
+        )
+
+    else:
+
+        st.info(
+            "Consulta de precios pendiente "
+            "de configurar con el esquema oficial."
+        )
+
+    st.caption(
+        "Las credenciales se leen desde variables "
+        "de entorno. Nunca se muestran en pantalla."
+    )
+
+
+uploaded_file = st.file_uploader(
+    "Cargar cotización Cisco",
+    type=["xlsx"]
+)
+
+if uploaded_file:
+
+    try:
+
+        workbook, original_df, headers, header_row = (
+            load_quote(uploaded_file.getvalue())
+        )
+
+        if "quote_df" not in st.session_state:
+            st.session_state.quote_df = original_df.copy()
+
+        df = st.session_state.quote_df
+
+        st.success(
+            "Cotización cargada correctamente."
+        )
+
+        col1, col2, col3 = st.columns(3)
+
+        col1.metric(
+            "Líneas",
+            len(df)
+        )
+
+        col2.metric(
+            "SKU diferentes",
+            df["Part Number"].nunique()
+        )
+
+        col3.metric(
+            "Moneda",
+            "USD"
+        )
+
+        st.subheader("Productos de la cotización")
+
+        editable_columns = [
+            column for column in [
+                "Part Number",
+                "Description",
+                "Unit List Price",
+                "Qty",
+                "Disc(%)",
+                "Unit Net Price",
+                "Extended Net Price"
+            ]
+            if column in df.columns
+        ]
+
+        edited_df = st.data_editor(
+            df[editable_columns],
             use_container_width=True,
-            num_rows="dynamic",
-            column_config={
-                "Unit List Price": st.column_config.NumberColumn(format="%.2f", min_value=0.0),
-                "Qty": st.column_config.NumberColumn(format="%.0f", min_value=1),
-                "Disc(%)": st.column_config.NumberColumn(format="%.2f", min_value=0.0, max_value=100.0),
-                "Unit Net Price": st.column_config.NumberColumn(disabled=True, format="%.2f"),
-                "Extended Net Price": st.column_config.NumberColumn(disabled=True, format="%.2f"),
-            },
+            disabled=[
+                column for column in editable_columns
+                if column not in [
+                    "Qty",
+                    "Disc(%)"
+                ]
+            ],
             key="quote_editor"
         )
-        edited = normalize_df(edited)
-        st.session_state.data = edited
-        total = edited["Extended Net Price"].sum()
-        a, b, c = st.columns(3)
-        a.metric("Product / líneas", len(edited))
-        b.metric("Total estimado", f"{currency} {total:,.2f}")
-        c.metric("Descuento promedio", f"{edited['Disc(%)'].mean() if len(edited) else 0:.2f}%")
 
-        xlsx = export_quote(edited, meta, currency)
-        st.download_button("Descargar cotización actualizada", data=xlsx,
-                           file_name="Cisco_Price_Manager_Quote.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    else:
-        st.info("Carga una cotización Cisco para conservar sus líneas y editar descuentos.")
+        # Incorporar cantidades y descuentos editados.
+        for column in ["Qty", "Disc(%)"]:
 
-with tab_skus:
-    st.subheader("Agregar SKU manualmente")
-    st.write("Puedes pegar uno o varios SKU, uno por línea. Para cada referencia podrás completar descripción, precio de lista, cantidad y descuento.")
-    sku_text = st.text_area("SKU Cisco", placeholder="C1121X-8P\nCON-L1NCD-C1121X8P\nPWR-66W-AC-V2", height=120)
-    if st.button("Agregar SKU a la cotización", type="primary"):
-        new_rows = []
-        existing = set(st.session_state.data["Part Number"].astype(str)) if not st.session_state.data.empty else set()
-        for sku in [x.strip() for x in sku_text.splitlines() if x.strip()]:
-            if sku not in existing:
-                new_rows.append({
-                    "Part Number": sku, "Smart Account Mandatory": "",
-                    "Description": "", "Service Duration (Months)": "",
-                    "Estimated Lead Time (Days)": "", "Unit List Price": 0.0,
-                    "Pricing Term": "", "Qty": 1, "Unit Net Price": 0.0,
-                    "Disc(%)": 0.0, "Extended Net Price": 0.0
-                })
-        if new_rows:
-            st.session_state.data = pd.concat([st.session_state.data, pd.DataFrame(new_rows)], ignore_index=True)
-            st.success(f"Se agregaron {len(new_rows)} SKU. Completa los datos en la pestaña Cotización desde Excel.")
-        else:
-            st.warning("No hay SKU nuevos para agregar.")
+            if column in edited_df.columns:
+                df[column] = edited_df[column]
 
-    if not st.session_state.data.empty:
-        st.dataframe(st.session_state.data[["Part Number", "Description", "Unit List Price", "Disc(%)", "Unit Net Price"]], use_container_width=True)
+        st.session_state.quote_df = df
 
-with tab_compare:
-    st.subheader("Comparar cotización anterior contra nueva")
-    old_file = st.file_uploader("Cotización anterior (.xlsx)", type=["xlsx"], key="old_file")
-    new_file = st.file_uploader("Cotización nueva (.xlsx)", type=["xlsx"], key="new_file")
-    if old_file and new_file:
-        try:
-            old_df, _ = parse_cisco_quote(old_file)
-            new_df, _ = parse_cisco_quote(new_file)
-            old_map = old_df.groupby("Part Number")["Unit List Price"].last()
-            new_map = new_df.groupby("Part Number")["Unit List Price"].last()
-            keys = sorted(set(old_map.index) | set(new_map.index))
-            comp = pd.DataFrame({"Part Number": keys})
-            comp["Precio anterior"] = comp["Part Number"].map(old_map)
-            comp["Precio nuevo"] = comp["Part Number"].map(new_map)
-            comp["Variación absoluta"] = comp["Precio nuevo"] - comp["Precio anterior"]
-            comp["Variación (%)"] = ((comp["Precio nuevo"] / comp["Precio anterior"]) - 1) * 100
-            comp["Estado"] = comp.apply(
-                lambda r: "Nuevo SKU" if pd.isna(r["Precio anterior"]) else
-                          ("Ya no aparece" if pd.isna(r["Precio nuevo"]) else
-                           ("Sin cambio" if round(r["Variación absoluta"], 2) == 0 else "Cambio de precio")), axis=1)
-            st.dataframe(comp, use_container_width=True)
-            st.download_button("Descargar comparación CSV", comp.to_csv(index=False).encode("utf-8-sig"),
-                               "Comparacion_precios_Cisco.csv", "text/csv")
-        except Exception as e:
-            st.error(f"No pude comparar los archivos: {e}")
+        st.divider()
 
-st.divider()
-st.caption("Cisco Price Manager · Versión inicial · Los importes solo son válidos como datos cargados por el usuario hasta conectar una fuente oficial Cisco.")
+        col1, col2 = st.columns(2)
+
+        with col1:
+
+            if st.button(
+                "🔄 Actualizar precios desde Cisco",
+                type="primary",
+                use_container_width=True
+            ):
+
+                try:
+
+                    updated_df = refresh_prices(
+                        st.session_state.quote_df
+                    )
+
+                    st.session_state.quote_df = updated_df
+
+                    st.success(
+                        "Proceso de actualización terminado."
+                    )
+
+                except Exception as error:
+
+                    st.error(str(error))
+
+        with col2:
+
+            if st.button(
+                "🧮 Recalcular precios",
+                use_container_width=True
+            ):
+
+                df = st.session_state.quote_df.copy()
+
+                for index, row in df.iterrows():
+
+                    price = pd.to_numeric(
+                        row.get("Unit List Price"),
+                        errors="coerce"
+                    )
+
+                    discount = pd.to_numeric(
+                        row.get("Disc(%)", 0),
+                        errors="coerce"
+                    )
+
+                    quantity = pd.to_numeric(
+                        row.get("Qty", 1),
+                        errors="coerce"
+                    )
+
+                    if pd.notna(price):
+
+                        discount = (
+                            0 if pd.isna(discount)
+                            else discount
+                        )
+
+                        quantity = (
+                            1 if pd.isna(quantity)
+                            else quantity
+                        )
+
+                        net = price * (
+                            1 - discount / 100
+                        )
+
+                        df.at[index, "Unit Net Price"] = net
+
+                        df.at[index, "Extended Net Price"] = (
+                            net * quantity
+                        )
+
+                st.session_state.quote_df = df
+
+                st.success(
+                    "Precios recalculados."
+                )
+
+        st.subheader("Resultado")
+
+        result_df = st.session_state.quote_df
+
+        display_columns = [
+            column for column in [
+                "Part Number",
+                "Description",
+                "Unit List Price",
+                "Qty",
+                "Disc(%)",
+                "Unit Net Price",
+                "Extended Net Price",
+                "Cisco Status",
+                "Last Updated"
+            ]
+            if column in result_df.columns
+        ]
+
+        st.dataframe(
+            result_df[display_columns],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        total = pd.to_numeric(
+            result_df.get(
+                "Extended Net Price",
+                pd.Series(dtype=float)
+            ),
+            errors="coerce"
+        ).sum()
+
+        st.metric(
+            "Total de productos",
+            f"USD {total:,.2f}"
+        )
+
+        export_bytes = export_quote(
+            workbook,
+            result_df,
+            headers,
+            header_row
+        )
+
+        st.download_button(
+            "📥 Descargar cotización actualizada",
+            data=export_bytes,
+            file_name="Cisco_Quote_Updated.xlsx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            use_container_width=True
+        )
+
+    except Exception as error:
+
+        st.error(
+            f"No fue posible procesar la cotización: {error}"
+        )
+
+else:
+
+    st.info(
+        "Carga una cotización Cisco en formato XLSX "
+        "para comenzar."
+    )
