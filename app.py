@@ -2,15 +2,17 @@
 import os
 import io
 import json
-import time
-import requests
+import sqlite3
+from datetime import datetime, timezone
+
 import pandas as pd
+import requests
 import streamlit as st
 from openpyxl import load_workbook
-from datetime import datetime
+
 
 # ============================================================
-# CONFIGURACION
+# 1. CONFIGURACION GENERAL
 # ============================================================
 
 st.set_page_config(
@@ -19,40 +21,460 @@ st.set_page_config(
     layout="wide"
 )
 
+APP_TITLE = "Cisco Price Manager"
+DATABASE = "cisco_price_manager.db"
+
 TOKEN_URL = "https://id.cisco.com/oauth2/default/v1/token"
 
-# No se inventa el endpoint GraphQL.
-# Se debe configurar con la URL exacta indicada por Cisco
-# para la aplicación y entorno que hayan sido aprobados.
 
-CLIENT_ID = os.getenv("CISCO_CLIENT_ID", "")
-CLIENT_SECRET = os.getenv("CISCO_CLIENT_SECRET", "")
-GRAPHQL_URL = os.getenv("CISCO_GRAPHQL_URL", "")
+# ============================================================
+# 2. CONFIGURACION SEGURA
+# Lee primero variables de entorno y luego Streamlit Secrets.
+# Nunca escribir credenciales directamente en este archivo.
+# ============================================================
 
-PRICE_QUERY = os.getenv("CISCO_PRICE_QUERY", "")
-VARIABLES_TEMPLATE = os.getenv(
-    "CISCO_PRICE_VARIABLES_TEMPLATE", ""
+def get_setting(name, default=""):
+    value = os.getenv(name)
+
+    if value:
+        return value
+
+    try:
+        value = st.secrets.get(name, default)
+        return value if value is not None else default
+    except Exception:
+        return default
+
+
+CLIENT_ID = get_setting("CISCO_CLIENT_ID")
+CLIENT_SECRET = get_setting("CISCO_CLIENT_SECRET")
+
+GRAPHQL_URL = get_setting("CISCO_GRAPHQL_URL")
+PRICE_QUERY = get_setting("CISCO_PRICE_QUERY")
+PRICE_VARIABLES = get_setting(
+    "CISCO_PRICE_VARIABLES_TEMPLATE"
 )
-PRICE_JSON_PATH = os.getenv("CISCO_PRICE_JSON_PATH", "")
+PRICE_JSON_PATH = get_setting("CISCO_PRICE_JSON_PATH")
+
 
 # ============================================================
-# ESTILOS
+# 3. BASE DE DATOS LOCAL
+# Guarda descuentos, precios manuales e historial.
 # ============================================================
 
-st.title("🌐 Cisco Price Manager")
-st.caption(
-    "Administración y actualización de precios de productos Cisco"
-)
+def get_connection():
+    return sqlite3.connect(DATABASE)
+
+
+def initialize_database():
+
+    with get_connection() as conn:
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                sku TEXT PRIMARY KEY,
+                manual_discount REAL DEFAULT 0,
+                manual_list_price REAL,
+                updated_at TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS price_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sku TEXT NOT NULL,
+                price REAL,
+                source TEXT,
+                recorded_at TEXT
+            )
+        """)
+
+
+def get_saved_product(sku):
+
+    with get_connection() as conn:
+
+        row = conn.execute(
+            """
+            SELECT manual_discount, manual_list_price
+            FROM products
+            WHERE sku = ?
+            """,
+            (sku,)
+        ).fetchone()
+
+    if row:
+        return {
+            "discount": row[0],
+            "manual_price": row[1]
+        }
+
+    return {
+        "discount": 0.0,
+        "manual_price": None
+    }
+
+
+def save_product(sku, discount, manual_price=None):
+
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with get_connection() as conn:
+
+        conn.execute(
+            """
+            INSERT INTO products (
+                sku,
+                manual_discount,
+                manual_list_price,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(sku) DO UPDATE SET
+                manual_discount = excluded.manual_discount,
+                manual_list_price = excluded.manual_list_price,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(sku),
+                float(discount),
+                manual_price,
+                now
+            )
+        )
+
+
+def save_price_history(sku, price, source):
+
+    with get_connection() as conn:
+
+        conn.execute(
+            """
+            INSERT INTO price_history (
+                sku,
+                price,
+                source,
+                recorded_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                str(sku),
+                float(price),
+                source,
+                datetime.now().isoformat(timespec="seconds")
+            )
+        )
+
+
+def load_price_history():
+
+    with get_connection() as conn:
+
+        return pd.read_sql_query(
+            """
+            SELECT
+                sku AS SKU,
+                price AS Price,
+                source AS Source,
+                recorded_at AS Date
+            FROM price_history
+            ORDER BY recorded_at DESC
+            LIMIT 500
+            """,
+            conn
+        )
+
+
+initialize_database()
+
 
 # ============================================================
-# AUTENTICACION CISCO
+# 4. UTILIDADES
+# ============================================================
+
+def normalize_header(value):
+
+    if value is None:
+        return ""
+
+    return (
+        str(value)
+        .strip()
+        .lower()
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+        .replace(".", "")
+    )
+
+
+HEADER_ALIASES = {
+    "sku": [
+        "partnumber",
+        "sku",
+        "productnumber",
+        "materialnumber"
+    ],
+    "description": [
+        "description",
+        "productdescription",
+        "itemdescription"
+    ],
+    "list_price": [
+        "unitlistprice",
+        "listprice",
+        "unitprice"
+    ],
+    "discount": [
+        "disc(%)",
+        "disc%",
+        "discount(%)",
+        "discount%",
+        "discount"
+    ],
+    "quantity": [
+        "qty",
+        "quantity"
+    ],
+    "net_price": [
+        "unitnetprice",
+        "netunitprice"
+    ],
+    "extended": [
+        "extendednetprice",
+        "extendedprice",
+        "totalnetprice"
+    ]
+}
+
+
+def find_column_mapping(worksheet):
+
+    best_row = None
+    best_mapping = {}
+    best_score = 0
+
+    for row_number in range(1, min(worksheet.max_row, 60) + 1):
+
+        values = {}
+
+        for col in range(1, worksheet.max_column + 1):
+
+            raw = worksheet.cell(
+                row_number,
+                col
+            ).value
+
+            normalized = normalize_header(raw)
+
+            if normalized:
+                values[normalized] = col
+
+        mapping = {}
+
+        for field, aliases in HEADER_ALIASES.items():
+
+            for alias in aliases:
+
+                normalized_alias = normalize_header(alias)
+
+                if normalized_alias in values:
+                    mapping[field] = values[normalized_alias]
+                    break
+
+        score = len(mapping)
+
+        if "sku" in mapping and score > best_score:
+
+            best_row = row_number
+            best_mapping = mapping
+            best_score = score
+
+    if best_row is None:
+        raise ValueError(
+            "No se encontró una columna Part Number o SKU."
+        )
+
+    return best_row, best_mapping
+
+
+def safe_float(value, default=0.0):
+
+    if value is None or value == "":
+        return default
+
+    try:
+
+        if isinstance(value, str):
+            value = value.replace("$", "").replace(",", "").strip()
+
+        return float(value)
+
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_optional_float(value):
+
+    if value is None or value == "":
+        return None
+
+    try:
+
+        if isinstance(value, str):
+            value = value.replace("$", "").replace(",", "").strip()
+
+        return float(value)
+
+    except (ValueError, TypeError):
+        return None
+
+
+# ============================================================
+# 5. LECTURA DE COTIZACIONES EXCEL
+# ============================================================
+
+def read_quote(file_bytes):
+
+    workbook = load_workbook(
+        io.BytesIO(file_bytes)
+    )
+
+    worksheet = workbook.active
+
+    header_row, mapping = find_column_mapping(worksheet)
+
+    records = []
+
+    for row_number in range(header_row + 1, worksheet.max_row + 1):
+
+        sku_value = worksheet.cell(
+            row_number,
+            mapping["sku"]
+        ).value
+
+        if sku_value is None:
+            continue
+
+        sku = str(sku_value).strip()
+
+        if not sku:
+            continue
+
+        description = ""
+
+        if "description" in mapping:
+
+            description = worksheet.cell(
+                row_number,
+                mapping["description"]
+            ).value or ""
+
+        list_price = None
+
+        if "list_price" in mapping:
+
+            list_price = safe_optional_float(
+                worksheet.cell(
+                    row_number,
+                    mapping["list_price"]
+                ).value
+            )
+
+        quantity = 1
+
+        if "quantity" in mapping:
+
+            quantity = safe_float(
+                worksheet.cell(
+                    row_number,
+                    mapping["quantity"]
+                ).value,
+                1
+            )
+
+        discount = 0
+
+        if "discount" in mapping:
+
+            discount = safe_float(
+                worksheet.cell(
+                    row_number,
+                    mapping["discount"]
+                ).value,
+                0
+            )
+
+        net_price = None
+
+        if "net_price" in mapping:
+
+            net_price = safe_optional_float(
+                worksheet.cell(
+                    row_number,
+                    mapping["net_price"]
+                ).value
+            )
+
+        extended = None
+
+        if "extended" in mapping:
+
+            extended = safe_optional_float(
+                worksheet.cell(
+                    row_number,
+                    mapping["extended"]
+                ).value
+            )
+
+        saved = get_saved_product(sku)
+
+        # El descuento guardado en la aplicación tiene prioridad.
+        if saved["discount"] is not None:
+            discount = saved["discount"]
+
+        # Si no existe precio en el Excel, usar un precio manual
+        # guardado previamente. Nunca inventar un precio.
+        if list_price is None and saved["manual_price"] is not None:
+            list_price = saved["manual_price"]
+
+        records.append({
+            "Excel Row": row_number,
+            "Part Number": sku,
+            "Description": str(description),
+            "Unit List Price": list_price,
+            "Qty": quantity,
+            "Disc (%)": discount,
+            "Unit Net Price": net_price,
+            "Extended Net Price": extended,
+            "Price Source": (
+                "Cotización original"
+                if list_price is not None
+                else "Sin precio"
+            ),
+            "Cisco Status": "Pendiente",
+            "Last Updated": ""
+        })
+
+    if not records:
+        raise ValueError(
+            "No se encontraron productos en la cotización."
+        )
+
+    return workbook, worksheet.title, header_row, mapping, pd.DataFrame(records)
+
+
+# ============================================================
+# 6. AUTENTICACION OAUTH CISCO
 # ============================================================
 
 def get_cisco_token():
 
     if not CLIENT_ID or not CLIENT_SECRET:
-        raise ValueError(
-            "Faltan CISCO_CLIENT_ID o CISCO_CLIENT_SECRET."
+
+        raise RuntimeError(
+            "Faltan CISCO_CLIENT_ID y CISCO_CLIENT_SECRET."
         )
 
     response = requests.post(
@@ -70,36 +492,34 @@ def get_cisco_token():
     )
 
     if response.status_code != 200:
+
         raise RuntimeError(
-            f"Error de autenticación Cisco: HTTP "
+            f"Autenticación Cisco fallida: HTTP "
             f"{response.status_code}. "
-            "Revisa el registro y los permisos de la aplicación."
+            "Verifica la aprobación y configuración de la aplicación."
         )
 
-    data = response.json()
+    payload = response.json()
 
-    token = data.get("access_token")
+    token = payload.get("access_token")
 
     if not token:
         raise RuntimeError(
-            "Cisco no devolvió un access_token."
+            "Cisco no devolvió un token de acceso."
         )
 
     return token
 
 
 # ============================================================
-# FUNCIONES GRAPHQL
+# 7. ADAPTADOR GRAPHQL CISCO
+#
+# Esta función queda preparada, pero requiere la consulta
+# REAL publicada para la aplicación aprobada.
+# No se inventan nombres de campos ni operaciones.
 # ============================================================
 
-def get_json_path(data, path):
-
-    """
-    Lee un campo anidado de una respuesta JSON.
-
-    Ejemplo:
-    data.catalog.product.listPrice
-    """
+def get_nested_value(data, path):
 
     current = data
 
@@ -113,7 +533,7 @@ def get_json_path(data, path):
 
         else:
             raise KeyError(
-                f"No se encontró la ruta: {path}"
+                f"No existe la ruta de respuesta: {path}"
             )
 
     return current
@@ -121,37 +541,29 @@ def get_json_path(data, path):
 
 def query_cisco_price(sku, token):
 
-    """
-    Consulta un SKU mediante la operación GraphQL
-    configurada con la documentación oficial de Cisco.
+    required = {
+        "CISCO_GRAPHQL_URL": GRAPHQL_URL,
+        "CISCO_PRICE_QUERY": PRICE_QUERY,
+        "CISCO_PRICE_VARIABLES_TEMPLATE": PRICE_VARIABLES,
+        "CISCO_PRICE_JSON_PATH": PRICE_JSON_PATH
+    }
 
-    La consulta, variables y ruta de respuesta deben
-    corresponder exactamente al esquema autorizado.
-    """
+    missing = [
+        name for name, value in required.items()
+        if not value
+    ]
 
-    if not GRAPHQL_URL:
-        raise ValueError(
-            "No está configurado CISCO_GRAPHQL_URL."
+    if missing:
+
+        raise RuntimeError(
+            "La conexión Cisco todavía no está configurada. "
+            "Faltan: " + ", ".join(missing)
         )
 
-    if not PRICE_QUERY:
-        raise ValueError(
-            "No está configurado CISCO_PRICE_QUERY."
-        )
-
-    if not VARIABLES_TEMPLATE:
-        raise ValueError(
-            "No está configurado "
-            "CISCO_PRICE_VARIABLES_TEMPLATE."
-        )
-
-    if not PRICE_JSON_PATH:
-        raise ValueError(
-            "No está configurado CISCO_PRICE_JSON_PATH."
-        )
-
-    variables_text = VARIABLES_TEMPLATE.replace(
-        "{{SKU}}", sku
+    # El marcador {{SKU}} se sustituye dentro del JSON de variables.
+    variables_text = PRICE_VARIABLES.replace(
+        "{{SKU}}",
+        json.dumps(str(sku))
     )
 
     variables = json.loads(variables_text)
@@ -171,156 +583,60 @@ def query_cisco_price(sku, token):
     )
 
     if response.status_code != 200:
+
         raise RuntimeError(
-            f"Error Cisco HTTP {response.status_code}"
+            f"Consulta Cisco fallida: HTTP {response.status_code}"
         )
 
-    result = response.json()
+    payload = response.json()
 
-    if result.get("errors"):
+    if payload.get("errors"):
+
         raise RuntimeError(
-            "Cisco devolvió errores GraphQL: "
-            + json.dumps(result["errors"], ensure_ascii=False)
+            "Error GraphQL: "
+            + json.dumps(
+                payload["errors"],
+                ensure_ascii=False
+            )[:1500]
         )
 
-    price = get_json_path(
-        result,
+    raw_price = get_nested_value(
+        payload,
         PRICE_JSON_PATH
     )
 
-    if price is None:
-        raise ValueError(
-            "Cisco no devolvió un precio."
-        )
-
-    price = float(price)
+    price = float(raw_price)
 
     if price < 0:
-        raise ValueError(
-            "El precio devuelto no es válido."
-        )
+        raise ValueError("Cisco devolvió un precio negativo.")
 
     return price
 
 
 # ============================================================
-# LECTURA DE COTIZACION
+# 8. ACTUALIZACION DE PRECIOS
 # ============================================================
 
-def find_header_row(workbook):
+def refresh_cisco_prices(dataframe):
 
-    ws = workbook.active
+    if not all([
+        CLIENT_ID,
+        CLIENT_SECRET,
+        GRAPHQL_URL,
+        PRICE_QUERY,
+        PRICE_VARIABLES,
+        PRICE_JSON_PATH
+    ]):
 
-    for row_number in range(1, 40):
-
-        values = [
-            str(cell.value).strip()
-            if cell.value is not None else ""
-            for cell in ws[row_number]
-        ]
-
-        if (
-            "Part Number" in values
-            and "Unit List Price" in values
-        ):
-            return row_number
-
-    raise ValueError(
-        "No se encontró la fila de encabezados "
-        "de la cotización Cisco."
-    )
-
-
-def load_quote(file_bytes):
-
-    workbook = load_workbook(
-        io.BytesIO(file_bytes)
-    )
-
-    ws = workbook.active
-
-    header_row = find_header_row(workbook)
-
-    headers = {}
-
-    for column in range(1, ws.max_column + 1):
-
-        value = ws.cell(
-            header_row,
-            column
-        ).value
-
-        if value is not None:
-            headers[str(value).strip()] = column
-
-    required = [
-        "Part Number",
-        "Unit List Price",
-        "Unit Net Price",
-        "Disc(%)",
-        "Qty",
-        "Extended Net Price"
-    ]
-
-    missing = [
-        field for field in required
-        if field not in headers
-    ]
-
-    if missing:
-        raise ValueError(
-            "Faltan columnas requeridas: "
-            + ", ".join(missing)
+        raise RuntimeError(
+            "La conexión real con Cisco aún no está configurada. "
+            "Puedes utilizar el modo local mientras esperas "
+            "la aprobación y la documentación de Cisco."
         )
-
-    records = []
-
-    for row in range(header_row + 1, ws.max_row + 1):
-
-        sku = ws.cell(
-            row,
-            headers["Part Number"]
-        ).value
-
-        if not sku:
-            continue
-
-        record = {
-            "Excel Row": row,
-            "Part Number": str(sku).strip()
-        }
-
-        for field in headers:
-
-            if field == "Part Number":
-                continue
-
-            record[field] = ws.cell(
-                row,
-                headers[field]
-            ).value
-
-        records.append(record)
-
-    df = pd.DataFrame(records)
-
-    if df.empty:
-        raise ValueError(
-            "La cotización no contiene SKU."
-        )
-
-    return workbook, df, headers, header_row
-
-
-# ============================================================
-# ACTUALIZACION DE PRECIOS
-# ============================================================
-
-def refresh_prices(df):
-
-    df = df.copy()
 
     token = get_cisco_token()
+
+    df = dataframe.copy()
 
     unique_skus = (
         df["Part Number"]
@@ -330,7 +646,7 @@ def refresh_prices(df):
         .tolist()
     )
 
-    price_results = {}
+    results = {}
 
     progress = st.progress(0)
     status = st.empty()
@@ -348,17 +664,23 @@ def refresh_prices(df):
                 token
             )
 
-            price_results[sku] = {
+            results[sku] = {
                 "price": price,
-                "status": "Actualizado",
+                "status": "Actualizado por Cisco",
                 "error": ""
             }
 
+            save_price_history(
+                sku,
+                price,
+                "Cisco API"
+            )
+
         except Exception as error:
 
-            price_results[sku] = {
+            results[sku] = {
                 "price": None,
-                "status": "Sin actualizar",
+                "status": "No actualizado",
                 "error": str(error)
             }
 
@@ -366,110 +688,185 @@ def refresh_prices(df):
             (index + 1) / len(unique_skus)
         )
 
-        time.sleep(0.1)
-
-    status.success(
-        "Finalizó la consulta de SKU."
-    )
-
-    df["Cisco List Price"] = df["Part Number"].map(
-        lambda sku: price_results.get(
-            str(sku),
-            {}
-        ).get("price")
-    )
-
-    df["Cisco Status"] = df["Part Number"].map(
-        lambda sku: price_results.get(
-            str(sku),
-            {}
-        ).get("status", "Sin consultar")
-    )
-
-    df["Cisco Error"] = df["Part Number"].map(
-        lambda sku: price_results.get(
-            str(sku),
-            {}
-        ).get("error", "")
-    )
-
-    # Solo reemplazar precios cuando Cisco devuelve
-    # un valor válido. Los descuentos se conservan.
-
     for index, row in df.iterrows():
 
-        new_price = row["Cisco List Price"]
+        sku = str(row["Part Number"])
+        result = results[sku]
 
-        if pd.notna(new_price):
+        if result["price"] is not None:
 
-            discount = pd.to_numeric(
-                row.get("Disc(%)", 0),
-                errors="coerce"
+            df.at[index, "Unit List Price"] = result["price"]
+            df.at[index, "Price Source"] = "Cisco API"
+            df.at[index, "Cisco Status"] = result["status"]
+
+        else:
+
+            df.at[index, "Cisco Status"] = (
+                result["status"] + ": " + result["error"]
             )
 
-            quantity = pd.to_numeric(
-                row.get("Qty", 1),
-                errors="coerce"
-            )
-
-            discount = (
-                0 if pd.isna(discount) else discount
-            )
-
-            quantity = (
-                1 if pd.isna(quantity) else quantity
-            )
-
-            net_price = new_price * (
-                1 - discount / 100
-            )
-
-            df.at[index, "Unit List Price"] = new_price
-            df.at[index, "Unit Net Price"] = net_price
-            df.at[index, "Extended Net Price"] = (
-                net_price * quantity
-            )
+    df = calculate_prices(df)
 
     df["Last Updated"] = datetime.now().strftime(
         "%Y-%m-%d %H:%M:%S"
     )
 
+    status.success("Consulta finalizada.")
+
     return df
 
 
 # ============================================================
-# EXPORTAR EXCEL
+# 9. CALCULO DE PRECIOS
 # ============================================================
+
+def calculate_prices(dataframe):
+
+    df = dataframe.copy()
+
+    for index, row in df.iterrows():
+
+        list_price = safe_optional_float(
+            row["Unit List Price"]
+        )
+
+        discount = safe_float(
+            row["Disc (%)"],
+            0
+        )
+
+        quantity = safe_float(
+            row["Qty"],
+            1
+        )
+
+        if discount < 0 or discount > 100:
+            raise ValueError(
+                f"Descuento inválido para {row['Part Number']}. "
+                "Debe estar entre 0 y 100."
+            )
+
+        if quantity < 0:
+            raise ValueError(
+                f"Cantidad inválida para {row['Part Number']}."
+            )
+
+        if list_price is None:
+
+            df.at[index, "Unit Net Price"] = None
+            df.at[index, "Extended Net Price"] = None
+
+        else:
+
+            net_price = list_price * (
+                1 - discount / 100
+            )
+
+            df.at[index, "Unit Net Price"] = net_price
+
+            df.at[index, "Extended Net Price"] = (
+                net_price * quantity
+            )
+
+    return df
+
+
+# ============================================================
+# 10. GUARDAR CONFIGURACION MANUAL
+# ============================================================
+
+def persist_manual_values(df):
+
+    for _, row in df.iterrows():
+
+        sku = str(row["Part Number"])
+
+        discount = safe_float(
+            row["Disc (%)"],
+            0
+        )
+
+        source = str(row.get("Price Source", ""))
+
+        manual_price = None
+
+        if source in [
+            "Precio manual",
+            "Precio editado manualmente"
+        ]:
+
+            manual_price = safe_optional_float(
+                row["Unit List Price"]
+            )
+
+        save_product(
+            sku,
+            discount,
+            manual_price
+        )
+
+
+# ============================================================
+# 11. EXPORTAR EXCEL CONSERVANDO LA COTIZACION ORIGINAL
+# ============================================================
+
+def write_cell(worksheet, row, column, value):
+
+    if column is None:
+        return
+
+    cell = worksheet.cell(row, column)
+
+    if value is None or pd.isna(value):
+        cell.value = None
+    else:
+        cell.value = float(value)
+
 
 def export_quote(
     workbook,
-    df,
-    headers,
-    header_row
+    worksheet_name,
+    header_row,
+    mapping,
+    dataframe
 ):
 
-    ws = workbook.active
+    worksheet = workbook[worksheet_name]
 
-    for _, record in df.iterrows():
+    # Se actualizan únicamente las columnas que existen.
+    # Las demás hojas y el resto del formato se conservan.
+
+    for _, record in dataframe.iterrows():
 
         excel_row = int(record["Excel Row"])
 
-        for field in [
-            "Unit List Price",
-            "Unit Net Price",
-            "Extended Net Price"
-        ]:
+        write_cell(
+            worksheet,
+            excel_row,
+            mapping.get("list_price"),
+            record["Unit List Price"]
+        )
 
-            if field in headers:
+        write_cell(
+            worksheet,
+            excel_row,
+            mapping.get("discount"),
+            record["Disc (%)"]
+        )
 
-                value = record.get(field)
+        write_cell(
+            worksheet,
+            excel_row,
+            mapping.get("net_price"),
+            record["Unit Net Price"]
+        )
 
-                if pd.notna(value):
-
-                    ws.cell(
-                        excel_row,
-                        headers[field]
-                    ).value = float(value)
+        write_cell(
+            worksheet,
+            excel_row,
+            mapping.get("extended"),
+            record["Extended Net Price"]
+        )
 
     output = io.BytesIO()
 
@@ -481,250 +878,390 @@ def export_quote(
 
 
 # ============================================================
-# INTERFAZ
+# 12. INTERFAZ PRINCIPAL
 # ============================================================
+
+st.title("🌐 Cisco Price Manager")
+
+st.caption(
+    "Gestión de cotizaciones, precios de lista y descuentos Cisco"
+)
+
+st.markdown(
+    """
+    Carga una cotización Cisco, revisa los productos,
+    administra descuentos y actualiza precios cuando
+    la conexión autorizada esté disponible.
+    """
+)
+
+# ---------------- SIDEBAR ----------------
 
 with st.sidebar:
 
-    st.header("Conexión Cisco")
+    st.header("Configuración")
 
-    if CLIENT_ID and CLIENT_SECRET:
+    st.subheader("Estado de Cisco API")
 
-        st.success(
-            "Credenciales configuradas"
-        )
+    credentials_ready = bool(
+        CLIENT_ID and CLIENT_SECRET
+    )
 
+    query_ready = bool(
+        GRAPHQL_URL
+        and PRICE_QUERY
+        and PRICE_VARIABLES
+        and PRICE_JSON_PATH
+    )
+
+    if credentials_ready:
+        st.success("Credenciales OAuth configuradas")
     else:
+        st.warning("Credenciales OAuth pendientes")
 
-        st.warning(
-            "Faltan credenciales OAuth"
-        )
-
-    if GRAPHQL_URL and PRICE_QUERY:
-
-        st.success(
-            "Consulta GraphQL configurada"
-        )
-
+    if query_ready:
+        st.success("Consulta de precios configurada")
     else:
+        st.warning("Consulta GraphQL pendiente")
 
-        st.info(
-            "Consulta de precios pendiente "
-            "de configurar con el esquema oficial."
-        )
+    if credentials_ready and query_ready:
+        st.info("Conexión preparada para probar")
+    else:
+        st.info("La aplicación funciona en modo local")
+
+    st.divider()
 
     st.caption(
-        "Las credenciales se leen desde variables "
-        "de entorno. Nunca se muestran en pantalla."
+        "Los precios manuales no se presentan como "
+        "precios verificados por Cisco."
     )
 
 
+# ---------------- CARGA DE COTIZACION ----------------
+
 uploaded_file = st.file_uploader(
-    "Cargar cotización Cisco",
-    type=["xlsx"]
+    "Cargar cotización Cisco (.xlsx)",
+    type=["xlsx"],
+    help="Carga una cotización descargada de Cisco CCW."
 )
 
 if uploaded_file:
 
+    file_bytes = uploaded_file.getvalue()
+
+    quote_key = (
+        uploaded_file.name,
+        len(file_bytes)
+    )
+
+    if st.session_state.get("quote_key") != quote_key:
+
+        try:
+
+            (
+                workbook,
+                worksheet_name,
+                header_row,
+                mapping,
+                dataframe
+            ) = read_quote(file_bytes)
+
+            st.session_state.quote_key = quote_key
+            st.session_state.workbook_bytes = file_bytes
+            st.session_state.worksheet_name = worksheet_name
+            st.session_state.header_row = header_row
+            st.session_state.mapping = mapping
+            st.session_state.quote_df = dataframe
+
+        except Exception as error:
+
+            st.error(
+                f"No se pudo leer la cotización: {error}"
+            )
+
+            st.stop()
+
+    df = st.session_state.quote_df.copy()
+
+    # ---------------- INDICADORES ----------------
+
+    total_lines = len(df)
+    unique_skus = df["Part Number"].nunique()
+
+    missing_prices = df["Unit List Price"].apply(
+        lambda value: safe_optional_float(value) is None
+    ).sum()
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric("Líneas", total_lines)
+    col2.metric("SKU únicos", unique_skus)
+    col3.metric("Sin precio", int(missing_prices))
+    col4.metric(
+        "Moneda",
+        "USD"
+    )
+
+    st.divider()
+
+    # ---------------- TABLA EDITABLE ----------------
+
+    st.subheader("Productos de la cotización")
+
+    st.caption(
+        "Puedes modificar cantidades, descuentos y precios "
+        "manualmente. Los precios de Cisco se identificarán "
+        "por separado."
+    )
+
+    editable_columns = [
+        "Excel Row",
+        "Part Number",
+        "Description",
+        "Unit List Price",
+        "Qty",
+        "Disc (%)",
+        "Unit Net Price",
+        "Extended Net Price",
+        "Price Source",
+        "Cisco Status",
+        "Last Updated"
+    ]
+
+    edited = st.data_editor(
+        df[editable_columns],
+        use_container_width=True,
+        hide_index=True,
+        disabled=[
+            "Excel Row",
+            "Part Number",
+            "Description",
+            "Unit Net Price",
+            "Extended Net Price",
+            "Price Source",
+            "Cisco Status",
+            "Last Updated"
+        ],
+        column_config={
+            "Unit List Price": st.column_config.NumberColumn(
+                "Unit List Price",
+                min_value=0,
+                format="%.2f"
+            ),
+            "Qty": st.column_config.NumberColumn(
+                "Qty",
+                min_value=0,
+                step=1
+            ),
+            "Disc (%)": st.column_config.NumberColumn(
+                "Disc (%)",
+                min_value=0,
+                max_value=100,
+                step=0.1,
+                format="%.2f%%"
+            )
+        },
+        key="products_editor"
+    )
+
+    # Detectar cambios manuales en precio.
+    for index in df.index:
+
+        old_price = safe_optional_float(
+            df.at[index, "Unit List Price"]
+        )
+
+        new_price = safe_optional_float(
+            edited.at[index, "Unit List Price"]
+        )
+
+        if new_price != old_price:
+
+            df.at[index, "Price Source"] = (
+                "Precio editado manualmente"
+            )
+
+            df.at[index, "Cisco Status"] = (
+                "Precio manual; pendiente de validación Cisco"
+            )
+
+    df["Qty"] = edited["Qty"].values
+    df["Disc (%)"] = edited["Disc (%)"].values
+    df["Unit List Price"] = edited["Unit List Price"].values
+
     try:
 
-        workbook, original_df, headers, header_row = (
-            load_quote(uploaded_file.getvalue())
-        )
+        df = calculate_prices(df)
 
-        if "quote_df" not in st.session_state:
-            st.session_state.quote_df = original_df.copy()
-
-        df = st.session_state.quote_df
-
-        st.success(
-            "Cotización cargada correctamente."
-        )
-
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric(
-            "Líneas",
-            len(df)
-        )
-
-        col2.metric(
-            "SKU diferentes",
-            df["Part Number"].nunique()
-        )
-
-        col3.metric(
-            "Moneda",
-            "USD"
-        )
-
-        st.subheader("Productos de la cotización")
-
-        editable_columns = [
-            column for column in [
-                "Part Number",
-                "Description",
-                "Unit List Price",
-                "Qty",
-                "Disc(%)",
-                "Unit Net Price",
-                "Extended Net Price"
-            ]
-            if column in df.columns
-        ]
-
-        edited_df = st.data_editor(
-            df[editable_columns],
-            use_container_width=True,
-            disabled=[
-                column for column in editable_columns
-                if column not in [
-                    "Qty",
-                    "Disc(%)"
-                ]
-            ],
-            key="quote_editor"
-        )
-
-        # Incorporar cantidades y descuentos editados.
-        for column in ["Qty", "Disc(%)"]:
-
-            if column in edited_df.columns:
-                df[column] = edited_df[column]
+        persist_manual_values(df)
 
         st.session_state.quote_df = df
 
-        st.divider()
+    except Exception as error:
 
-        col1, col2 = st.columns(2)
+        st.error(str(error))
 
-        with col1:
+    st.divider()
 
-            if st.button(
-                "🔄 Actualizar precios desde Cisco",
-                type="primary",
-                use_container_width=True
-            ):
+    # ---------------- ACCIONES ----------------
 
-                try:
+    st.subheader("Acciones")
 
-                    updated_df = refresh_prices(
-                        st.session_state.quote_df
-                    )
+    col1, col2, col3 = st.columns(3)
 
-                    st.session_state.quote_df = updated_df
+    with col1:
 
-                    st.success(
-                        "Proceso de actualización terminado."
-                    )
+        if st.button(
+            "🧮 Recalcular",
+            use_container_width=True
+        ):
 
-                except Exception as error:
+            try:
 
-                    st.error(str(error))
-
-        with col2:
-
-            if st.button(
-                "🧮 Recalcular precios",
-                use_container_width=True
-            ):
-
-                df = st.session_state.quote_df.copy()
-
-                for index, row in df.iterrows():
-
-                    price = pd.to_numeric(
-                        row.get("Unit List Price"),
-                        errors="coerce"
-                    )
-
-                    discount = pd.to_numeric(
-                        row.get("Disc(%)", 0),
-                        errors="coerce"
-                    )
-
-                    quantity = pd.to_numeric(
-                        row.get("Qty", 1),
-                        errors="coerce"
-                    )
-
-                    if pd.notna(price):
-
-                        discount = (
-                            0 if pd.isna(discount)
-                            else discount
-                        )
-
-                        quantity = (
-                            1 if pd.isna(quantity)
-                            else quantity
-                        )
-
-                        net = price * (
-                            1 - discount / 100
-                        )
-
-                        df.at[index, "Unit Net Price"] = net
-
-                        df.at[index, "Extended Net Price"] = (
-                            net * quantity
-                        )
+                df = calculate_prices(
+                    st.session_state.quote_df
+                )
 
                 st.session_state.quote_df = df
 
-                st.success(
-                    "Precios recalculados."
+                st.success("Precios recalculados.")
+
+            except Exception as error:
+
+                st.error(str(error))
+
+    with col2:
+
+        if st.button(
+            "🔄 Actualizar desde Cisco",
+            type="primary",
+            use_container_width=True
+        ):
+
+            try:
+
+                updated = refresh_cisco_prices(
+                    st.session_state.quote_df
                 )
 
-        st.subheader("Resultado")
+                st.session_state.quote_df = updated
 
-        result_df = st.session_state.quote_df
+                persist_manual_values(updated)
 
-        display_columns = [
-            column for column in [
+                st.success(
+                    "Proceso de actualización finalizado."
+                )
+
+            except Exception as error:
+
+                st.error(str(error))
+
+    with col3:
+
+        if st.button(
+            "🧹 Limpiar cotización",
+            use_container_width=True
+        ):
+
+            for key in [
+                "quote_key",
+                "workbook_bytes",
+                "worksheet_name",
+                "header_row",
+                "mapping",
+                "quote_df"
+            ]:
+
+                st.session_state.pop(key, None)
+
+            st.rerun()
+
+    # ---------------- RESULTADOS ----------------
+
+    st.divider()
+
+    st.subheader("Resumen de precios")
+
+    result = st.session_state.quote_df.copy()
+
+    total = pd.to_numeric(
+        result["Extended Net Price"],
+        errors="coerce"
+    ).sum()
+
+    valid_prices = result["Unit List Price"].apply(
+        lambda value: safe_optional_float(value) is not None
+    ).sum()
+
+    updated_prices = (
+        result["Cisco Status"]
+        .astype(str)
+        .str.contains("Actualizado por Cisco", case=False)
+        .sum()
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Total calculado",
+        f"USD {total:,.2f}"
+    )
+
+    col2.metric(
+        "Líneas con precio",
+        f"{int(valid_prices)} / {len(result)}"
+    )
+
+    col3.metric(
+        "Líneas actualizadas por Cisco",
+        int(updated_prices)
+    )
+
+    st.dataframe(
+        result[
+            [
                 "Part Number",
                 "Description",
                 "Unit List Price",
                 "Qty",
-                "Disc(%)",
+                "Disc (%)",
                 "Unit Net Price",
                 "Extended Net Price",
+                "Price Source",
                 "Cisco Status",
                 "Last Updated"
             ]
-            if column in result_df.columns
-        ]
+        ],
+        use_container_width=True,
+        hide_index=True
+    )
 
-        st.dataframe(
-            result_df[display_columns],
-            use_container_width=True,
-            hide_index=True
+    # ---------------- EXPORTAR ----------------
+
+    st.divider()
+
+    st.subheader("Exportar cotización")
+
+    try:
+
+        original_workbook = load_workbook(
+            io.BytesIO(
+                st.session_state.workbook_bytes
+            )
         )
 
-        total = pd.to_numeric(
-            result_df.get(
-                "Extended Net Price",
-                pd.Series(dtype=float)
-            ),
-            errors="coerce"
-        ).sum()
-
-        st.metric(
-            "Total de productos",
-            f"USD {total:,.2f}"
-        )
-
-        export_bytes = export_quote(
-            workbook,
-            result_df,
-            headers,
-            header_row
+        excel_bytes = export_quote(
+            original_workbook,
+            st.session_state.worksheet_name,
+            st.session_state.header_row,
+            st.session_state.mapping,
+            result
         )
 
         st.download_button(
             "📥 Descargar cotización actualizada",
-            data=export_bytes,
-            file_name="Cisco_Quote_Updated.xlsx",
+            data=excel_bytes,
+            file_name="Cisco_Price_Manager_Updated.xlsx",
             mime=(
                 "application/vnd.openxmlformats-officedocument."
                 "spreadsheetml.sheet"
@@ -735,8 +1272,9 @@ if uploaded_file:
     except Exception as error:
 
         st.error(
-            f"No fue posible procesar la cotización: {error}"
+            f"No se pudo generar el Excel: {error}"
         )
+
 
 else:
 
@@ -744,3 +1282,60 @@ else:
         "Carga una cotización Cisco en formato XLSX "
         "para comenzar."
     )
+
+    st.markdown(
+        """
+        **Funciones disponibles en modo local**
+
+        - Importar cotizaciones.
+        - Identificar SKU.
+        - Editar precios y descuentos.
+        - Calcular precios netos.
+        - Guardar descuentos y precios manuales localmente.
+        - Consultar historial.
+        - Exportar la cotización.
+        """
+    )
+
+
+# ============================================================
+# 13. HISTORIAL DE PRECIOS
+# ============================================================
+
+st.divider()
+
+with st.expander("📊 Historial de precios"):
+
+    history = load_price_history()
+
+    if history.empty:
+
+        st.info(
+            "Todavía no hay consultas de precios registradas."
+        )
+
+    else:
+
+        st.dataframe(
+            history,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        history_csv = history.to_csv(
+            index=False
+        ).encode("utf-8")
+
+        st.download_button(
+            "Descargar historial CSV",
+            data=history_csv,
+            file_name="Cisco_Price_History.csv",
+            mime="text/csv"
+        )
+
+
+st.caption(
+    "Cisco Price Manager | Los precios solo se consideran "
+    "verificados por Cisco cuando la API devuelve una respuesta válida."
+)
+
