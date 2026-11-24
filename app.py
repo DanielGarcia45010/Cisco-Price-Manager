@@ -30,10 +30,37 @@ COUNTRY_RATES = {
     "St Vincent": 0.15, "Trinidad": 0.15, "Turks and Caicos": 0.15, "USVI": 0.15,
 }
 
-HARDWARE_SKUS = {
-    "C1121-4P", "C1121X-8P", "C1121-8P",
-    "C8200L-1N-4T", "C8300-1N1S-6T", "C8300-2N2S-6T",
-}
+# Clasificación semántica: no se mantiene un catálogo cerrado de SKUs/modelos.
+# Las palabras describen categorías de producto y componentes, no referencias Cisco.
+EQUIPMENT_TYPES = (
+    "router", "switch", "firewall", "security appliance",
+    "access point", "wireless controller", "wireless access point", "wireless lan controller",
+    "server", "storage array", "storage system", "network appliance", "load balancer",
+    "voice gateway", "unified communications", "video endpoint", "collaboration endpoint",
+    "ip phone", "conference phone", "telephone", "camera", "codec", "compute node",
+    "chassis", "fabric interconnect", "wireless gateway", "network gateway",
+    "wan optimizer", "wan ports", "nim slot", "sd-wan appliance", "sdwan appliance", "security gateway",
+    # Categorías generales para reconocer familias nuevas sin mantener un catálogo de SKUs.
+    "network device", "communications device", "communication system", "video system",
+    "compute system", "storage appliance", "security device", "edge device",
+    "access device", "base station", "wireless device", "terminal device",
+)
+COMPONENT_TERMS = (
+    "rack mount", "rackmount", "mount kit", "wallmount", "mounting kit",
+    "power supply", "power cord", "power cable", "power adapter", "power module",
+    "fan tray", "fan module", "blank", "memory", "dram", "license", "licence",
+    "subscription", "support", "service", "maintenance", "cable", "cord",
+    "transceiver", "optic", "optics", "antenna", "bracket", "rail kit",
+    "accessory", "accessories", "daughter card", "interface module",
+    "network module", "riser", "ssd", "hdd", "disk", "bezel", "adapter",
+    "software", "entitlement", "renewal", "replacement", "spare",
+    # Elementos intangibles y de configuración que suelen venir dentro del grupo del equipo.
+    "os essentials", "ios xe", "ios-xe", "operating system", "embedded", "perpetual",
+    "software image", "software license", "software licence", "plug-n-play", "plug and play",
+    "zero-touch", "zero touch", "te agent", "autonomous mode", "no rfid", "rfid",
+    "blank cover", "nim blank", "pim blank", "sm blank", "disk blank", "daughter card",
+)
+SERVICE_PREFIXES = ("CON-", "CON_", "SNT-", "SVS-", "SWSS-")
 
 QUOTE_ALIASES = {
     "part_number": ["Part Number", "PartNumber", "SKU", "Product Number"],
@@ -147,37 +174,74 @@ def read_cisco_quote(file_bytes: bytes) -> tuple[list[dict[str, Any]], dict[str,
     }
 
 
-def group_quote_by_equipment(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Cada fila principal de hardware inicia un grupo. Todos los renglones de
-    Cisco Commerce hasta el siguiente hardware pertenecen a ese equipo.
-    El coste del grupo incluye tangibles e intangibles. Solo los renglones
-    con Service Duration > 0 se escalan con el plazo seleccionado.
-    """
+def classify_quote_line(product: dict[str, Any]) -> str:
+    """Devuelve equipment, component o ambiguous sin depender de un catálogo SKU."""
+    description = norm(product.get("description", ""))
+    part_number = str(product.get("part_number", "")).strip().upper()
+
+    if product.get("duration") is not None:
+        return "component"
+    # En las cotizaciones Cisco, los renglones de configuración, licencias,
+    # opciones y accesorios suelen tener precio cero. No deben abrir un equipo
+    # nuevo ni quedar fuera del costo agregado: se asocian al equipo anterior.
+    if float(product.get("extended") or 0.0) == 0.0:
+        return "component"
+    if part_number.startswith(SERVICE_PREFIXES):
+        return "component"
+    if any(term in description for term in COMPONENT_TERMS):
+        return "component"
+    if any(term in description for term in EQUIPMENT_TYPES):
+        return "equipment"
+
+    # Sin señales suficientes no se fuerza una clasificación: se solicita revisión.
+    return "ambiguous"
+
+
+def group_quote_by_equipment(
+    products: list[dict[str, Any]], classifications: dict[int, str] | None = None
+) -> list[dict[str, Any]]:
+    """Agrupa las líneas según la clasificación automática y las decisiones revisadas."""
     groups: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
+    classifications = classifications or {}
 
-    for product in products:
-        pn = product["part_number"].upper()
-        if pn in HARDWARE_SKUS:
+    for index, product in enumerate(products):
+        classification = classifications.get(index, classify_quote_line(product))
+        if classification == "equipment":
             if current is not None:
                 groups.append(current)
             current = {
                 "part_number": product["part_number"],
                 "description": product["description"],
-                "hardware_cost": float(product["extended"]),
+                "hardware_cost": float(product["extended"] or 0.0),
                 "components": [product],
                 "secured": False,
             }
-        elif current is not None:
+        elif classification == "component" and current is not None:
             current["components"].append(product)
-            if "SEC-SV" in pn or "SECURITY" in product["description"].upper():
+            pn = str(product.get("part_number", "")).upper()
+            desc = str(product.get("description", "")).upper()
+            if "SEC-SV" in pn or "SECURITY" in desc:
                 current["secured"] = True
 
     if current is not None:
         groups.append(current)
-
     return groups
+
+
+def ambiguous_quote_lines(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prepara las líneas cuya naturaleza no se puede inferir con seguridad."""
+    rows = []
+    for index, product in enumerate(products):
+        if classify_quote_line(product) == "ambiguous":
+            rows.append({
+                "Fila": index + 1,
+                "Part Number": product["part_number"],
+                "Descripción": product["description"],
+                "Valor extendido": float(product["extended"] or 0.0),
+                "Clasificación": "Revisar",
+            })
+    return rows
 
 
 def equipment_cost_at_term(group: dict[str, Any], months: int) -> float:
@@ -222,6 +286,7 @@ def create_output(
     margin: float,
     return_rate: float,
     markup: float,
+    classifications: dict[int, str] | None = None,
 ) -> bytes:
     wb = load_workbook(io.BytesIO(template_bytes), data_only=False)
     if "Calculadora" not in wb.sheetnames:
@@ -237,14 +302,21 @@ def create_output(
             del wb[name]
     wb._external_links = []
 
-    groups = group_quote_by_equipment(quote_products)
+    groups = group_quote_by_equipment(quote_products, classifications)
     if not groups:
         raise ValueError("No encontré equipos principales en la cotización.")
-    if len(groups) > 10:
-        raise ValueError(
-            f"La cotización contiene {len(groups)} equipos principales y la plantilla tiene "
-            "10 filas disponibles. Amplía la plantilla antes de continuar."
-        )
+    # La plantilla trae 10 filas de equipos. Si la cotización tiene más,
+    # se insertan filas automáticamente antes del resumen y se conserva el formato.
+    extra_rows = max(0, len(groups) - 10)
+    if extra_rows:
+        ws.insert_rows(19, amount=extra_rows)
+        for new_row in range(19, 19 + extra_rows):
+            for col in range(1, 12):
+                copy_style(ws.cell(18, col), ws.cell(new_row, col))
+        ws.row_dimensions[19].height = ws.row_dimensions[18].height
+
+    table_end = 8 + len(groups)
+    summary_start = 20 + extra_rows
 
     # Inputs principales de la calculadora.
     ws["B1"] = nrc_rate
@@ -264,10 +336,16 @@ def create_output(
 
     # Tabla de soporte oculta con cada componente de cada equipo.
     # P = número de equipo, Q = SKU, R = descripción, S = valor neto,
-    # T = duración en meses (0 significa que no se proyecta).
-    headers = ["Equipment Index", "Part Number", "Description", "Extended Net Price", "Service Duration"]
+    # T = duración en meses (0 significa que no se proyecta),
+    # W = costo proyectado por línea. Esta columna auxiliar evita depender
+    # de operaciones matriciales dentro de SUMPRODUCT.
+    headers = [
+        "Equipment Index", "Part Number", "Description",
+        "Extended Net Price", "Service Duration",
+    ]
     for col, header in enumerate(headers, start=16):
         ws.cell(1, col).value = header
+    ws.cell(1, 23).value = "Projected Component Cost"
 
     support_row = 2
     for equipment_idx, group in enumerate(groups, start=1):
@@ -277,7 +355,11 @@ def create_output(
             ws.cell(support_row, 18).value = component["description"]
             ws.cell(support_row, 19).value = float(component["extended"] or 0.0)
             ws.cell(support_row, 20).value = float(component["duration"] or 0.0)
+            ws.cell(support_row, 23).value = (
+                f'=IF(T{support_row}>0,S{support_row}*$B$3/T{support_row},S{support_row})'
+            )
             ws.cell(support_row, 19).number_format = '$#,##0.00'
+            ws.cell(support_row, 23).number_format = '$#,##0.00'
             support_row += 1
 
     # Base física del router, separada de licencias/servicios para aduanas.
@@ -290,7 +372,7 @@ def create_output(
     last_support = max(2, support_row - 1)
     # Fórmula B: componentes sin duración + componentes con duración escalados.
     # Fórmula D: tasa de aduanas × solo el precio físico del router.
-    for row in range(9, 19):
+    for row in range(9, max(19, 9 + len(groups))):
         idx = row - 8
         if idx <= len(groups):
             group = groups[idx - 1]
@@ -303,9 +385,7 @@ def create_output(
                 label = group["part_number"] + (" (Secured)" if group["secured"] else "")
             ws.cell(row, 1).value = label
             ws.cell(row, 2).value = (
-                f'=SUMIFS($S$2:$S${last_support},$P$2:$P${last_support},{idx},$T$2:$T${last_support},0)'
-                f'+SUMPRODUCT(($P$2:$P${last_support}={idx})*($T$2:$T${last_support}>0)'
-                f'*$S$2:$S${last_support}*IFERROR($B$3/$T$2:$T${last_support},0))'
+                f'=SUMIFS($W$2:$W${last_support},$P$2:$P${last_support},{idx})'
             )
             ws.cell(row, 3).value = shipping_per_equipment
             ws.cell(row, 4).value = f'=$B$5*INDEX($V$2:$V${len(groups)+1},ROW()-8)'
@@ -317,7 +397,7 @@ def create_output(
 
     # Mantener las fórmulas originales de la plantilla para E:K.
     # Si se encuentran vacías, reconstruirlas siguiendo las fórmulas originales.
-    for row in range(9, 19):
+    for row in range(9, max(19, 9 + len(groups))):
         if ws.cell(row, 1).value is None:
             continue
         ws.cell(row, 5).value = f"=SUM(B{row}:D{row})"
@@ -328,35 +408,38 @@ def create_output(
         ws.cell(row, 10).value = f"=(G{row}+H{row})*1.1"
         ws.cell(row, 11).value = f"=-PMT($B$2/12,$B$3,(I{row}-J{row}),0)"
 
-    # Resumen: los costes con duración se muestran en Services, pero ya están
-    # incluidos en Equipment Cost por dispositivo. Se separan en el resumen
-    # para evitar sumarlos dos veces.
-    ws["B20"] = "Equipment & Other Costs"
-    ws["C20"] = "Projected Services"
-    ws["D20"] = "Total"
-    ws["B21"] = "=SUM(E9:E18)-C21"
-    ws["C21"] = (
+    # Resumen dinámico: las filas se desplazan automáticamente si hay más de
+    # 10 equipos. Los servicios se separan para evitar doble contabilización.
+    r1 = summary_start + 1
+    r2 = summary_start + 2
+    r3 = summary_start + 3
+    r4 = summary_start + 4
+    ws.cell(summary_start, 2).value = "Equipment & Other Costs"
+    ws.cell(summary_start, 3).value = "Projected Services"
+    ws.cell(summary_start, 4).value = "Total"
+    ws.cell(r1, 2).value = f"=SUM(E9:E{table_end})-C{r1}"
+    ws.cell(r1, 3).value = (
         f'=SUMPRODUCT(($T$2:$T${last_support}>0)*$S$2:$S${last_support}'
         f'*IFERROR($B$3/$T$2:$T${last_support},0))'
     )
-    ws["D21"] = "=SUM(B21:C21)"
+    ws.cell(r1, 4).value = f"=SUM(B{r1}:C{r1})"
 
-    ws["A22"] = "Total Sales Price"
-    ws["B22"] = "=SUM(I9:I18)-C22"
-    ws["C22"] = "=IFERROR(C21/(1-$B$4),0)"
-    ws["D22"] = "=SUM(B22:C22)"
+    ws.cell(r2, 1).value = "Total Sales Price"
+    ws.cell(r2, 2).value = f"=SUM(I9:I{table_end})-C{r2}"
+    ws.cell(r2, 3).value = f"=IFERROR(C{r1}/(1-$B$4),0)"
+    ws.cell(r2, 4).value = f"=SUM(B{r2}:C{r2})"
 
-    ws["A23"] = "NRC"
-    ws["B23"] = "=SUM(J9:J18)"
-    ws["C23"] = "=IFERROR((C21/(1-$B$4))*$B$1,0)"
-    ws["D23"] = "=SUM(B23:C23)"
+    ws.cell(r3, 1).value = "NRC"
+    ws.cell(r3, 2).value = f"=SUM(J9:J{table_end})"
+    ws.cell(r3, 3).value = f"=IFERROR((C{r1}/(1-$B$4))*$B$1,0)"
+    ws.cell(r3, 4).value = f"=SUM(B{r3}:C{r3})"
 
-    ws["A24"] = "MRC"
-    ws["B24"] = "=SUM(K9:K18)-C24"
-    ws["C24"] = "=-PMT($B$2/12,$B$3,C23/20%*80%,0)"
-    ws["D24"] = "=SUM(B24:C24)"
+    ws.cell(r4, 1).value = "MRC"
+    ws.cell(r4, 2).value = f"=SUM(K9:K{table_end})-C{r4}"
+    ws.cell(r4, 3).value = f"=-PMT($B$2/12,$B$3,C{r3}/20%*80%,0)"
+    ws.cell(r4, 4).value = f"=SUM(B{r4}:C{r4})"
 
-    for row in range(21, 25):
+    for row in range(r1, r4 + 1):
         for col in range(2, 5):
             ws.cell(row, col).number_format = '$#,##0.00;[Red]-$#,##0.00'
 
@@ -373,7 +456,7 @@ def create_output(
     )
 
     # Ocultar tablas auxiliares dentro de la misma hoja; no crear hojas adicionales.
-    for col in range(13, 23):
+    for col in range(13, 24):
         ws.column_dimensions[chr(64 + col)].hidden = True
 
     ws.sheet_view.showGridLines = False
@@ -448,10 +531,57 @@ with p6:
 
 markup = st.number_input("Markup", min_value=0.0, max_value=5.0, value=0.10, step=0.01, format="%.2f")
 
+classification_map: dict[int, str] = {}
+ambiguous_rows: list[dict[str, Any]] = []
+preview_products: list[dict[str, Any]] = []
+
 if quote_file is not None:
     try:
         preview_products, quote_meta = read_cisco_quote(quote_file.getvalue())
-        preview_groups = group_quote_by_equipment(preview_products)
+        ambiguous_rows = ambiguous_quote_lines(preview_products)
+
+        if ambiguous_rows:
+            st.markdown("### Revisión de productos no concluyentes")
+            st.caption(
+                "La aplicación clasificó automáticamente los productos reconocibles. "
+                "Indica cuáles de estas líneas son equipos principales, componentes o líneas que deben excluirse."
+            )
+            review_result = st.data_editor(
+                ambiguous_rows,
+                hide_index=True,
+                use_container_width=True,
+                key="quote_line_review",
+                disabled=["Fila", "Part Number", "Descripción", "Valor extendido"],
+                column_config={
+                    "Clasificación": st.column_config.SelectboxColumn(
+                        "Clasificación",
+                        options=["Revisar", "Equipo principal", "Componente", "Excluir"],
+                        required=True,
+                    )
+                },
+            )
+            # Streamlit puede devolver una lista cuando el editor recibe una lista,
+            # o un DataFrame cuando recibe una tabla. Admitimos ambos formatos.
+            review_records = (
+                review_result.to_dict("records")
+                if hasattr(review_result, "to_dict")
+                else list(review_result)
+            )
+            for row in review_records:
+                line_index = int(row["Fila"]) - 1
+                selected = row["Clasificación"]
+                if selected == "Equipo principal":
+                    classification_map[line_index] = "equipment"
+                elif selected == "Componente":
+                    classification_map[line_index] = "component"
+                elif selected == "Excluir":
+                    classification_map[line_index] = "exclude"
+
+            pending = sum(1 for row in review_records if row["Clasificación"] == "Revisar")
+            if pending:
+                st.warning(f"Hay {pending} línea(s) pendientes de clasificación. Revísalas antes de generar el Excel.")
+
+        preview_groups = group_quote_by_equipment(preview_products, classification_map)
         st.markdown("### Vista previa de equipos")
         st.metric("Equipos identificados", len(preview_groups))
         st.dataframe(
@@ -472,15 +602,20 @@ if quote_file is not None:
     except Exception as exc:
         st.error(f"No pude leer la cotización: {exc}")
 
+review_pending = any(
+    classify_quote_line(product) == "ambiguous" and index not in classification_map
+    for index, product in enumerate(preview_products)
+)
+
 if st.button(
     "Generar calculadora Excel",
     type="primary",
     use_container_width=True,
-    disabled=(quote_file is None or template_file is None),
+    disabled=(quote_file is None or template_file is None or review_pending),
 ):
     try:
         quote_products, _ = read_cisco_quote(quote_file.getvalue())
-        groups = group_quote_by_equipment(quote_products)
+        groups = group_quote_by_equipment(quote_products, classification_map)
         output_bytes = create_output(
             template_file.getvalue(),
             quote_products,
@@ -491,6 +626,7 @@ if st.button(
             margin,
             return_rate,
             markup,
+            classification_map,
         )
         filename = f"Cisco_Calculadora_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
         st.success("Calculadora generada correctamente. El archivo tiene una sola hoja.")
