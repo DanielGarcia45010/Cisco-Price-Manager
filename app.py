@@ -8,79 +8,42 @@ from typing import Any
 
 import streamlit as st
 from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, Alignment
 from openpyxl.worksheet.datavalidation import DataValidation
-from openpyxl.utils import get_column_letter
 
 
 # ============================================================
 # CISCO PRICE MANAGER
-# Una sola hoja de calculadora con escenarios seleccionables.
-# No requiere credenciales ni API de Cisco.
+# Una sola hoja Calculadora con plazo seleccionable en Excel.
 # ============================================================
 
-st.set_page_config(
-    page_title="Cisco Price Manager",
-    page_icon="🌐",
-    layout="wide",
-)
+st.set_page_config(page_title="Cisco Price Manager", page_icon="🌐", layout="wide")
 
 COUNTRY_RATES = {
-    "Anguilla": 0.15,
-    "Antigua": 0.15,
-    "Aruba": 0.18,
-    "Bahamas": 0.60,
-    "Barbados": 0.15,
-    "Belize": 0.20,
-    "BVI": 0.15,
-    "Cayman": 0.15,
-    "Colombia": 0.26,
-    "Costa Rica": 0.14,
-    "Curacao": 0.17,
-    "Dominica": 0.15,
-    "Dominican Rep": 0.18,
-    "Ecuador": 0.34,
-    "El Salvador": 0.18,
-    "Grenada": 0.15,
-    "Guatemala": 0.18,
-    "Haiti": 0.18,
-    "Honduras": 0.18,
-    "Jamaica": 0.26,
-    "Mexico": 0.18,
-    "Nicaragua": 0.18,
-    "Panama": 0.15,
-    "Peru": 0.34,
-    "Puerto Rico": 0.15,
-    "St Kitts": 0.15,
-    "St Lucia": 0.15,
-    "St Marteen": 0.17,
-    "St Vincent": 0.15,
-    "Trinidad": 0.15,
-    "Turks and Caicos": 0.15,
-    "USVI": 0.15,
+    "Anguilla": 0.15, "Antigua": 0.15, "Aruba": 0.18, "Bahamas": 0.60,
+    "Barbados": 0.15, "Belize": 0.20, "BVI": 0.15, "Cayman": 0.15,
+    "Colombia": 0.26, "Costa Rica": 0.14, "Curacao": 0.17, "Dominica": 0.15,
+    "Dominican Rep": 0.18, "Ecuador": 0.34, "El Salvador": 0.18, "Grenada": 0.15,
+    "Guatemala": 0.18, "Haiti": 0.18, "Honduras": 0.18, "Jamaica": 0.26,
+    "Mexico": 0.18, "Nicaragua": 0.18, "Panama": 0.15, "Peru": 0.34,
+    "Puerto Rico": 0.15, "St Kitts": 0.15, "St Lucia": 0.15, "St Marteen": 0.17,
+    "St Vincent": 0.15, "Trinidad": 0.15, "Turks and Caicos": 0.15, "USVI": 0.15,
 }
 
-# Los modelos que aparecen en la tabla principal de la calculadora original.
-# Se incluyen exclusivamente equipos; no accesorios, fuentes, memorias ni licencias.
 HARDWARE_SKUS = {
-    "C1121-4P",
-    "C1121X-8P",
-    "C1121-8P",
-    "C8200L-1N-4T",
-    "C8300-1N1S-6T",
-    "C8300-2N2S-6T",
+    "C1121-4P", "C1121X-8P", "C1121-8P",
+    "C8200L-1N-4T", "C8300-1N1S-6T", "C8300-2N2S-6T",
 }
 
 QUOTE_ALIASES = {
     "part_number": ["Part Number", "PartNumber", "SKU", "Product Number"],
     "description": ["Description", "Product Description", "Item Description"],
     "duration": ["Service Duration (Months)", "Service Duration", "Duration (Months)"],
-    "list_price": ["Unit List Price", "List Price"],
     "quantity": ["Qty", "Quantity"],
-    "discount": ["Disc(%)", "Disc (%)", "Discount", "Discount (%)"],
     "unit_net": ["Unit Net Price", "Net Unit Price"],
     "extended": ["Extended Net Price", "Extended Price"],
-    "pricing_term": ["Pricing Term"],
+    "list_price": ["Unit List Price", "List Price"],
+    "discount": ["Disc(%)", "Disc (%)", "Discount", "Discount (%)"],
 }
 
 
@@ -88,7 +51,7 @@ def norm(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
 
-def number(value: Any, default: float | None = None) -> float | None:
+def to_number(value: Any, default: float | None = None) -> float | None:
     if value is None or value == "":
         return default
     if isinstance(value, (int, float)):
@@ -97,49 +60,44 @@ def number(value: Any, default: float | None = None) -> float | None:
     if not s or s.lower() in {"-", "---", "n/a", "na", "none"}:
         return default
     if "," in s and "." in s:
-        if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            s = s.replace(",", "")
+        s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
     elif "," in s:
-        parts = s.split(",")
-        s = s.replace(",", ".") if len(parts[-1]) in (1, 2) else s.replace(",", "")
+        tail = s.split(",")[-1]
+        s = s.replace(",", ".") if len(tail) in (1, 2) else s.replace(",", "")
     try:
         return float(s)
     except ValueError:
         return default
 
 
-def parse_months(value: Any) -> float | None:
+def parse_duration(value: Any) -> float | None:
     if value is None:
         return None
     if isinstance(value, (int, float)):
         return float(value) if value > 0 else None
-    m = re.search(r"(\d+(?:[.,]\d+)?)", str(value))
-    return number(m.group(1).replace(",", ".")) if m else None
+    match = re.search(r"(\d+(?:[.,]\d+)?)", str(value))
+    if not match:
+        return None
+    result = to_number(match.group(1).replace(",", "."))
+    return result if result and result > 0 else None
 
 
 def read_cisco_quote(file_bytes: bytes) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    aliases = {k: {norm(v) for v in vals} for k, vals in QUOTE_ALIASES.items()}
     selected_ws = None
     header_row = None
-    cmap: dict[str, int] = {}
+    columns: dict[str, int] = {}
 
-    alias_norm = {k: {norm(x) for x in v} for k, v in QUOTE_ALIASES.items()}
     for ws in wb.worksheets:
-        for r_idx, row in enumerate(
-            ws.iter_rows(min_row=1, max_row=min(ws.max_row, 50), values_only=True),
-            start=1,
+        for row_num, values in enumerate(
+            ws.iter_rows(min_row=1, max_row=min(ws.max_row, 50), values_only=True), start=1
         ):
-            found = {norm(v): i for i, v in enumerate(row) if v is not None}
-            if any(a in found for a in alias_norm["part_number"]) and any(
-                a in found for a in alias_norm["description"]
-            ):
-                selected_ws, header_row = ws, r_idx
-                for field, aliases in alias_norm.items():
-                    col = next((found[a] for a in aliases if a in found), None)
-                    if col is not None:
-                        cmap[field] = col
+            found = {norm(v): i for i, v in enumerate(values) if v is not None}
+            if (found.keys() & aliases["part_number"]) and (found.keys() & aliases["description"]):
+                selected_ws, header_row = ws, row_num
+                for field, names in aliases.items():
+                    columns[field] = next((found[n] for n in names if n in found), -1)
                 break
         if selected_ws:
             break
@@ -148,126 +106,104 @@ def read_cisco_quote(file_bytes: bytes) -> tuple[list[dict[str, Any]], dict[str,
         wb.close()
         raise ValueError("No encontré las columnas Part Number y Description en la cotización.")
 
-    rows: list[dict[str, Any]] = []
-    for row in selected_ws.iter_rows(min_row=header_row + 1, values_only=True):
-        pn_idx = cmap["part_number"]
-        pn_value = row[pn_idx] if pn_idx < len(row) else None
+    products = []
+    for values in selected_ws.iter_rows(min_row=header_row + 1, values_only=True):
+        pn_col = columns["part_number"]
+        pn_value = values[pn_col] if pn_col >= 0 and pn_col < len(values) else None
         if pn_value is None or not str(pn_value).strip():
+            # La tabla de Cisco termina en la primera fila sin Part Number.
             break
 
-        def get(field: str, default=None):
-            idx = cmap.get(field)
-            return row[idx] if idx is not None and idx < len(row) else default
+        def get(field: str):
+            col = columns.get(field, -1)
+            return values[col] if col >= 0 and col < len(values) else None
 
-        qty = number(get("quantity"), 1.0) or 1.0
-        list_price = number(get("list_price"))
-        discount = number(get("discount"), 0.0) or 0.0
-        unit_net = number(get("unit_net"))
-        extended = number(get("extended"))
+        qty = to_number(get("quantity"), 1.0) or 1.0
+        list_price = to_number(get("list_price"))
+        discount = to_number(get("discount"), 0.0) or 0.0
+        unit_net = to_number(get("unit_net"))
+        extended = to_number(get("extended"))
         if unit_net is None and list_price is not None:
             unit_net = list_price * (1 - discount / 100)
         if extended is None and unit_net is not None:
             extended = unit_net * qty
 
-        pn = str(pn_value).strip()
-        rows.append({
-            "part_number": pn,
-            "description": str(get("description", "") or "").strip(),
+        products.append({
+            "part_number": str(pn_value).strip(),
+            "description": str(get("description") or "").strip(),
             "quantity": qty,
+            "duration": parse_duration(get("duration")),
             "duration_raw": get("duration"),
-            "duration": parse_months(get("duration")),
-            "list_price": list_price,
-            "discount": discount,
-            "unit_net": unit_net,
             "extended": float(extended or 0.0),
-            "pricing_term": str(get("pricing_term", "") or "").strip(),
         })
 
     wb.close()
-    if not rows:
-        raise ValueError("No se encontraron productos debajo de los encabezados.")
-    return rows, {"sheet": selected_ws.title, "header_row": header_row, "line_count": len(rows)}
+    if not products:
+        raise ValueError("No se encontraron productos en la cotización.")
+    return products, {
+        "sheet": selected_ws.title,
+        "header_row": header_row,
+        "line_count": len(products),
+    }
 
 
-def identify_equipment(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def group_quote_by_equipment(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    Mantiene cada aparición física del equipo como renglón separado.
-    El sufijo '(Secured)' se asigna cuando en el mismo grupo de configuración
-    aparece un SKU de seguridad SL-...-SEC-SV.
+    Cada fila principal de hardware inicia un grupo. Todos los renglones de
+    Cisco Commerce hasta el siguiente hardware pertenecen a ese equipo.
+    El coste del grupo incluye tangibles e intangibles. Solo los renglones
+    con Service Duration > 0 se escalan con el plazo seleccionado.
     """
-    equipment: list[dict[str, Any]] = []
-    current_group: list[dict[str, Any]] = []
+    groups: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
 
-    def flush_group(group: list[dict[str, Any]]) -> None:
-        if not group:
-            return
-        has_security = any(
-            "SEC-SV" in str(x["part_number"]).upper()
-            or "SECURITY" in str(x["description"]).upper()
-            for x in group
-        )
-        for x in group:
-            pn = x["part_number"].upper()
-            if pn in HARDWARE_SKUS:
-                label = f"{x['part_number']} (Secured)" if has_security else x["part_number"]
-                equipment.append({
-                    "item": label,
-                    "part_number": x["part_number"],
-                    "description": x["description"],
-                    "quantity": x["quantity"],
-                    "equipment_cost": float(x["extended"] or 0.0),
-                })
-
-    for item in rows:
-        pn = item["part_number"].upper()
+    for product in products:
+        pn = product["part_number"].upper()
         if pn in HARDWARE_SKUS:
-            # Cada SKU de hardware inicia una configuración nueva.
-            flush_group(current_group)
-            current_group = [item]
-        elif current_group:
-            current_group.append(item)
-    flush_group(current_group)
-    return equipment
+            if current is not None:
+                groups.append(current)
+            current = {
+                "part_number": product["part_number"],
+                "description": product["description"],
+                "hardware_cost": float(product["extended"]),
+                "components": [product],
+                "secured": False,
+            }
+        elif current is not None:
+            current["components"].append(product)
+            if "SEC-SV" in pn or "SECURITY" in product["description"].upper():
+                current["secured"] = True
+
+    if current is not None:
+        groups.append(current)
+
+    return groups
 
 
-def service_projection_totals(rows: list[dict[str, Any]], months: int) -> tuple[float, list[dict[str, Any]]]:
-    """
-    Proyecta únicamente renglones clasificados por la regla acordada:
-    Part Number contiene CON o LIC. La duración se toma de Cisco.
-    """
-    detail = []
+def equipment_cost_at_term(group: dict[str, Any], months: int) -> float:
     total = 0.0
-    for x in rows:
-        pn = x["part_number"].upper()
-        if "CON" not in pn and "LIC" not in pn:
-            continue
-        base = float(x["extended"] or 0.0)
-        duration = x["duration"]
+    for component in group["components"]:
+        value = float(component["extended"] or 0.0)
+        duration = component["duration"]
         if duration and duration > 0:
-            projected = base * months / duration
-            rule = f"Proporcional desde {duration:g} meses"
-        else:
-            projected = base
-            rule = "Sin duración: conserva el valor original"
-        total += projected
-        detail.append({**x, "projected": projected, "rule": rule})
-    return total, detail
+            value *= months / duration
+        total += value
+    return round(total, 2)
 
 
-def clone_row_style(ws, source_row: int, target_row: int, max_col: int = 11) -> None:
-    for col in range(1, max_col + 1):
-        src, dst = ws.cell(source_row, col), ws.cell(target_row, col)
-        if src.has_style:
-            dst._style = copy(src._style)
-        if src.number_format:
-            dst.number_format = src.number_format
-        if src.alignment:
-            dst.alignment = copy(src.alignment)
-    if source_row in ws.row_dimensions and ws.row_dimensions[source_row].height:
-        ws.row_dimensions[target_row].height = ws.row_dimensions[source_row].height
+def add_dropdown(ws, cell_ref: str, formula: str, prompt: str, error: str) -> None:
+    validation = DataValidation(type="list", formula1=formula, allow_blank=False)
+    validation.promptTitle = "Selecciona una opción"
+    validation.prompt = prompt
+    validation.errorTitle = "Valor no válido"
+    validation.error = error
+    validation.showErrorMessage = True
+    validation.showInputMessage = True
+    ws.add_data_validation(validation)
+    validation.add(ws[cell_ref])
 
 
-def copy_cell_style(source, target) -> None:
+def copy_style(source, target) -> None:
     if source.has_style:
         target._style = copy(source._style)
     if source.number_format:
@@ -276,219 +212,181 @@ def copy_cell_style(source, target) -> None:
         target.alignment = copy(source.alignment)
 
 
-def parse_scenario_months(raw: str) -> list[int]:
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    if not parts:
-        raise ValueError("Indica al menos un plazo, por ejemplo: 12,24,36.")
-    values = []
-    for p in parts:
-        if not re.fullmatch(r"\d{1,3}", p):
-            raise ValueError(f"El plazo '{p}' no es válido. Usa meses enteros separados por comas.")
-        n = int(p)
-        if n < 1 or n > 600:
-            raise ValueError("Los plazos deben estar entre 1 y 600 meses.")
-        if n not in values:
-            values.append(n)
-    if len(values) > 8:
-        raise ValueError("Puedes generar máximo 8 escenarios en una misma hoja.")
-    return values
-
-
-def create_output(template_bytes: bytes, quote_rows: list[dict[str, Any]],
-                  months_list: list[int], country: str, shipping_per_equipment: float,
-                  margin: float, return_rate: float, markup: float) -> bytes:
+def create_output(
+    template_bytes: bytes,
+    quote_products: list[dict[str, Any]],
+    country: str,
+    months: int,
+    nrc_rate: float,
+    shipping_per_equipment: float,
+    margin: float,
+    return_rate: float,
+    markup: float,
+) -> bytes:
     wb = load_workbook(io.BytesIO(template_bytes), data_only=False)
-
     if "Calculadora" not in wb.sheetnames:
         raise ValueError("La plantilla debe contener la hoja 'Calculadora'.")
 
-    # Conservar únicamente la hoja que el usuario solicitó.
     ws = wb["Calculadora"]
-    for sheet_name in list(wb.sheetnames):
-        if sheet_name != "Calculadora":
-            del wb[sheet_name]
-    ws.title = "Calculadora"
+    # Guardar los nombres de los 10 equipos tal como están en la plantilla.
+    original_labels = [ws.cell(r, 1).value for r in range(9, 19)]
+
+    # Solo se conserva la hoja Calculadora.
+    for name in list(wb.sheetnames):
+        if name != "Calculadora":
+            del wb[name]
     wb._external_links = []
 
-    equipment = identify_equipment(quote_rows)
-    if not equipment:
+    groups = group_quote_by_equipment(quote_products)
+    if not groups:
+        raise ValueError("No encontré equipos principales en la cotización.")
+    if len(groups) > 10:
         raise ValueError(
-            "No encontré equipos principales de la lista de la calculadora "
-            "(C1121-4P, C1121X-8P, C1121-8P, C8200L-1N-4T, C8300-1N1S-6T, C8300-2N2S-6T)."
+            f"La cotización contiene {len(groups)} equipos principales y la plantilla tiene "
+            "10 filas disponibles. Amplía la plantilla antes de continuar."
         )
 
-    # Países y tasas embebidos en columnas ocultas de la misma hoja.
-    # Así se conserva la lista desplegable sin crear la hoja 'CPEs & Aduanas'.
-    country_start = 2
-    ws["M1"] = "Country list"
-    ws["N1"] = "Customs rate"
-    for i, (name, rate) in enumerate(COUNTRY_RATES.items(), start=country_start):
-        ws.cell(i, 13).value = name
-        ws.cell(i, 14).value = rate
-        ws.cell(i, 14).number_format = "0%"
-    ws.column_dimensions["M"].hidden = True
-    ws.column_dimensions["N"].hidden = True
+    # Inputs principales de la calculadora.
+    ws["B1"] = nrc_rate
+    ws["B2"] = return_rate
+    ws["B3"] = months
+    ws["B4"] = margin
+    ws["B5"] = '=IFERROR(INDEX($N$2:$N$33,MATCH(D5,$M$2:$M$33,0)),0)'
+    ws["D5"] = country
+    ws["B6"] = markup
 
-    # Usar el bloque original de la calculadora como plantilla visual.
-    base_block_height = 32
-    first_product_row = 9
-    max_products = len(equipment)
-    if max_products > 10:
-        ws.insert_rows(19, amount=max_products - 10)
+    # Lista de países y tasas en columnas ocultas de la misma hoja.
+    ws["M1"], ws["N1"] = "Country", "Customs Rate"
+    for row, (name, rate) in enumerate(COUNTRY_RATES.items(), start=2):
+        ws.cell(row, 13).value = name
+        ws.cell(row, 14).value = rate
+        ws.cell(row, 14).number_format = "0%"
 
-    # Guardar estilos del bloque original para replicarlo verticalmente.
-    style_rows = {}
-    for r in range(1, 31):
-        style_rows[r] = [copy(ws.cell(r, c)._style) if ws.cell(r, c).has_style else None
-                         for c in range(1, 15)]
-    row_heights = {r: ws.row_dimensions[r].height for r in range(1, 31)}
+    # Tabla de soporte oculta con cada componente de cada equipo.
+    # P = número de equipo, Q = SKU, R = descripción, S = valor neto,
+    # T = duración en meses (0 significa que no se proyecta).
+    headers = ["Equipment Index", "Part Number", "Description", "Extended Net Price", "Service Duration"]
+    for col, header in enumerate(headers, start=16):
+        ws.cell(1, col).value = header
 
-    # Primera sección usa el bloque original. Los escenarios siguientes se copian
-    # en la misma hoja, uno debajo del otro.
-    block_height = max(31, 24 + max(0, max_products - 10) + 3)
-    required_end = block_height * len(months_list)
-    if required_end > ws.max_row:
-        ws.insert_rows(ws.max_row + 1, amount=required_end - ws.max_row)
+    support_row = 2
+    for equipment_idx, group in enumerate(groups, start=1):
+        for component in group["components"]:
+            ws.cell(support_row, 16).value = equipment_idx
+            ws.cell(support_row, 17).value = component["part_number"]
+            ws.cell(support_row, 18).value = component["description"]
+            ws.cell(support_row, 19).value = float(component["extended"] or 0.0)
+            ws.cell(support_row, 20).value = float(component["duration"] or 0.0)
+            ws.cell(support_row, 19).number_format = '$#,##0.00'
+            support_row += 1
 
-    # Replicar estilos de filas del bloque original para los escenarios posteriores.
-    for idx in range(1, len(months_list)):
-        offset = idx * block_height
-        for r in range(1, 31):
-            target_r = r + offset
-            for c in range(1, 15):
-                src_cell = ws.cell(r, c)
-                dst_cell = ws.cell(target_r, c)
-                copy_cell_style(src_cell, dst_cell)
-                if row_heights.get(r) is not None:
-                    ws.row_dimensions[target_r].height = row_heights[r]
+    # Base física del router, separada de licencias/servicios para aduanas.
+    ws["U1"], ws["V1"] = "Equipment Index", "Physical Equipment Cost"
+    for equipment_idx, group in enumerate(groups, start=1):
+        ws.cell(equipment_idx + 1, 21).value = equipment_idx
+        ws.cell(equipment_idx + 1, 22).value = group["hardware_cost"]
+        ws.cell(equipment_idx + 1, 22).number_format = '$#,##0.00'
 
-    # Encabezado visual de cada escenario y fórmulas de calculadora.
-    for idx, months in enumerate(months_list):
-        off = idx * block_height
-        r1 = 1 + off
-        # Parámetros generales de la plantilla.
-        ws.cell(r1, 1).value = "NRC"
-        ws.cell(r1, 2).value = 0.20  # Valor original de la plantilla; no requiere cálculo manual.
-        ws.cell(r1 + 1, 1).value = "Return Rate"
-        ws.cell(r1 + 1, 2).value = return_rate
-        ws.cell(r1 + 2, 1).value = "Term (Months)"
-        ws.cell(r1 + 2, 2).value = months
-        ws.cell(r1 + 3, 1).value = "Marging"
-        ws.cell(r1 + 3, 2).value = margin
-        ws.cell(r1 + 4, 1).value = "Customs & Duties. %"
-        ws.cell(r1 + 4, 2).value = f'=IFERROR(INDEX($N$2:$N${len(COUNTRY_RATES)+1},MATCH(D{r1+4},$M$2:$M${len(COUNTRY_RATES)+1},0)),0)'
-        ws.cell(r1 + 4, 3).value = "Country"
-        ws.cell(r1 + 4, 4).value = country
-        ws.cell(r1 + 5, 1).value = "Markup"
-        ws.cell(r1 + 5, 2).value = markup
+    last_support = max(2, support_row - 1)
+    # Fórmula B: componentes sin duración + componentes con duración escalados.
+    # Fórmula D: tasa de aduanas × solo el precio físico del router.
+    for row in range(9, 19):
+        idx = row - 8
+        if idx <= len(groups):
+            group = groups[idx - 1]
+            # Conservar el nombre/etiqueta original de la calculadora cuando
+            # corresponde al mismo SKU; si no, usar la identificación de la cotización.
+            template_label = original_labels[idx - 1] if idx - 1 < len(original_labels) else None
+            if template_label and str(template_label).upper().startswith(group["part_number"].upper()):
+                label = template_label
+            else:
+                label = group["part_number"] + (" (Secured)" if group["secured"] else "")
+            ws.cell(row, 1).value = label
+            ws.cell(row, 2).value = (
+                f'=SUMIFS($S$2:$S${last_support},$P$2:$P${last_support},{idx},$T$2:$T${last_support},0)'
+                f'+SUMPRODUCT(($P$2:$P${last_support}={idx})*($T$2:$T${last_support}>0)'
+                f'*$S$2:$S${last_support}*IFERROR($B$3/$T$2:$T${last_support},0))'
+            )
+            ws.cell(row, 3).value = shipping_per_equipment
+            ws.cell(row, 4).value = f'=$B$5*INDEX($V$2:$V${len(groups)+1},ROW()-8)'
+            ws.cell(row, 2).number_format = '$#,##0.00;[Red]-$#,##0.00'
+            ws.cell(row, 4).number_format = '$#,##0.00;[Red]-$#,##0.00'
+        else:
+            for col in range(1, 12):
+                ws.cell(row, col).value = None
 
-        # Título que identifica el escenario sin agregar otra hoja.
-        ws.cell(r1 + 6, 1).value = f"CALCULATOR PROJECTION — {months} MONTHS"
-        ws.cell(r1 + 6, 1).font = Font(bold=True, size=12, color="17365D")
+    # Mantener las fórmulas originales de la plantilla para E:K.
+    # Si se encuentran vacías, reconstruirlas siguiendo las fórmulas originales.
+    for row in range(9, 19):
+        if ws.cell(row, 1).value is None:
+            continue
+        ws.cell(row, 5).value = f"=SUM(B{row}:D{row})"
+        ws.cell(row, 6).value = f"=B{row}/(1-$B$4)"
+        ws.cell(row, 7).value = f"=C{row}*(1+$B$6)"
+        ws.cell(row, 8).value = f"=D{row}*(1+$B$6)"
+        ws.cell(row, 9).value = f"=SUM(F{row}:H{row})"
+        ws.cell(row, 10).value = f"=(G{row}+H{row})*1.1"
+        ws.cell(row, 11).value = f"=-PMT($B$2/12,$B$3,(I{row}-J{row}),0)"
 
-        headers = [
-            "Item", "Equipment Cost", "Shipping & Handling Cost",
-            "Custom and Duties Cost", "Total Cost", "Equipment Price",
-            "Shipping Price", "Custom & Duties Price", "Total Price", "NRC", "MRC"
-        ]
-        for c, value in enumerate(headers, start=1):
-            cell = ws.cell(r1 + 7, c)
-            cell.value = value
-            cell.font = copy(ws["A8"].font) if ws["A8"].has_style else Font(bold=True)
-            cell.alignment = Alignment(wrap_text=True, vertical="center")
+    # Resumen: los costes con duración se muestran en Services, pero ya están
+    # incluidos en Equipment Cost por dispositivo. Se separan en el resumen
+    # para evitar sumarlos dos veces.
+    ws["B20"] = "Equipment & Other Costs"
+    ws["C20"] = "Projected Services"
+    ws["D20"] = "Total"
+    ws["B21"] = "=SUM(E9:E18)-C21"
+    ws["C21"] = (
+        f'=SUMPRODUCT(($T$2:$T${last_support}>0)*$S$2:$S${last_support}'
+        f'*IFERROR($B$3/$T$2:$T${last_support},0))'
+    )
+    ws["D21"] = "=SUM(B21:C21)"
 
-        first = r1 + 8
-        last = first + len(equipment) - 1
+    ws["A22"] = "Total Sales Price"
+    ws["B22"] = "=SUM(I9:I18)-C22"
+    ws["C22"] = "=IFERROR(C21/(1-$B$4),0)"
+    ws["D22"] = "=SUM(B22:C22)"
 
-        for j, item in enumerate(equipment):
-            r = first + j
-            if j >= 10:
-                clone_row_style(ws, r1 + 17, r)
-            ws.cell(r, 1).value = item["item"]
-            ws.cell(r, 2).value = round(item["equipment_cost"], 2)
-            ws.cell(r, 3).value = round(shipping_per_equipment, 2)
-            ws.cell(r, 4).value = f"=$B${r1+4}*B{r}"
-            ws.cell(r, 5).value = f"=SUM(B{r}:D{r})"
-            ws.cell(r, 6).value = f"=B{r}/(1-$B${r1+3})"
-            ws.cell(r, 7).value = f"=C{r}*(1+$B${r1+5})"
-            ws.cell(r, 8).value = f"=D{r}*(1+$B${r1+5})"
-            ws.cell(r, 9).value = f"=SUM(F{r}:H{r})"
-            # Fórmula NRC de la calculadora original. No se pide al usuario multiplicar nada.
-            ws.cell(r, 10).value = f"=(G{r}+H{r})*1.1"
-            ws.cell(r, 11).value = f"=-PMT($B${r1+1}/12,$B${r1+2},(I{r}-J{r}),0)"
-            for c in range(2, 12):
-                ws.cell(r, c).number_format = '$#,##0.00;[Red]-$#,##0.00'
+    ws["A23"] = "NRC"
+    ws["B23"] = "=SUM(J9:J18)"
+    ws["C23"] = "=IFERROR((C21/(1-$B$4))*$B$1,0)"
+    ws["D23"] = "=SUM(B23:C23)"
 
-        # Limpia las filas sobrantes del bloque original.
-        for r in range(first + len(equipment), first + max(10, len(equipment))):
-            for c in range(1, 12):
-                ws.cell(r, c).value = None
+    ws["A24"] = "MRC"
+    ws["B24"] = "=SUM(K9:K18)-C24"
+    ws["C24"] = "=-PMT($B$2/12,$B$3,C23/20%*80%,0)"
+    ws["D24"] = "=SUM(B24:C24)"
 
-        # Resumen de costos y precios. La celda de servicios sustituye el cálculo
-        # externo de SFP/CPE que dependía de un libro no proporcionado.
-        summary = r1 + 20 + max(0, len(equipment) - 10)
-        service_total, _ = service_projection_totals(quote_rows, months)
-        ws.cell(summary - 1, 2).value = "Equipment"
-        ws.cell(summary - 1, 3).value = "Services"
-        ws.cell(summary, 1).value = "Total Cost"
-        ws.cell(summary, 2).value = f"=SUM(E{first}:E{last})"
-        ws.cell(summary, 3).value = round(service_total, 2)
-        ws.cell(summary, 4).value = f"=B{summary}+C{summary}"
+    for row in range(21, 25):
+        for col in range(2, 5):
+            ws.cell(row, col).number_format = '$#,##0.00;[Red]-$#,##0.00'
 
-        ws.cell(summary + 1, 1).value = "Total Sales Price"
-        ws.cell(summary + 1, 2).value = f"=SUM(I{first}:I{last})"
-        ws.cell(summary + 1, 3).value = f"=C{summary}/(1-$B${r1+3})"
-        ws.cell(summary + 1, 4).value = f"=SUM(B{summary+1}:C{summary+1})"
+    # Validaciones desplegables: país y plazo de proyección.
+    add_dropdown(
+        ws, "D5", "=$M$2:$M$33",
+        "Selecciona el país para calcular aduanas.",
+        "Selecciona un país de la lista.",
+    )
+    add_dropdown(
+        ws, "B3", '"12,24,36,48"',
+        "Selecciona el plazo de la proyección en meses.",
+        "Selecciona 12, 24, 36 o 48 meses.",
+    )
 
-        ws.cell(summary + 2, 1).value = "NRC"
-        ws.cell(summary + 2, 2).value = f"=SUM(J{first}:J{last})"
-        ws.cell(summary + 2, 3).value = f"=(C{summary}/(1-$B${r1+3}))*$B${r1}"
-        ws.cell(summary + 2, 4).value = f"=B{summary+2}+C{summary+2}"
+    # Ocultar tablas auxiliares dentro de la misma hoja; no crear hojas adicionales.
+    for col in range(13, 23):
+        ws.column_dimensions[chr(64 + col)].hidden = True
 
-        ws.cell(summary + 3, 1).value = "MRC"
-        ws.cell(summary + 3, 2).value = f"=SUM(K{first}:K{last})"
-        ws.cell(summary + 3, 3).value = f"=-PMT($B${r1+1}/12,$B${r1+2},C{summary+2}/20%*80%,0)"
-        ws.cell(summary + 3, 4).value = f"=B{summary+3}+C{summary+3}"
-
-        for rr in range(summary, summary + 4):
-            for cc in range(2, 5):
-                ws.cell(rr, cc).number_format = '$#,##0.00;[Red]-$#,##0.00'
-
-        # Eliminar cualquier referencia externa remanente de la plantilla.
-        for rr in range(r1, summary + 5):
-            for cc in range(1, 15):
-                val = ws.cell(rr, cc).value
-                if isinstance(val, str) and "CPE Calculation" in val:
-                    ws.cell(rr, cc).value = None
-
-        # Lista desplegable de países en cada bloque.
-        dv = DataValidation(
-            type="list",
-            formula1=f"=$M$2:$M${len(COUNTRY_RATES)+1}",
-            allow_blank=False,
-        )
-        dv.error = "Selecciona un país de la lista."
-        dv.errorTitle = "País no válido"
-        dv.prompt = "Selecciona el país para calcular aduanas."
-        dv.promptTitle = "País"
-        ws.add_data_validation(dv)
-        dv.add(ws.cell(r1 + 4, 4))
-
-    # Dejar una única hoja y mostrar solo el área de la calculadora.
     ws.sheet_view.showGridLines = False
-    ws.freeze_panes = "A8"
-    ws.column_dimensions["A"].width = 27
-    for col in "BCDEFGHIJK":
-        ws.column_dimensions[col].width = 19
-    ws.column_dimensions["C"].width = 23
-    ws.column_dimensions["D"].width = 22
-    ws.column_dimensions["M"].hidden = True
-    ws.column_dimensions["N"].hidden = True
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
-    ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 0
-    ws.print_area = f"A1:K{block_height * len(months_list)}"
+    ws.freeze_panes = "A9"
+    ws["B1"].number_format = "0%"
+    ws["B2"].number_format = "0%"
+    ws["B4"].number_format = "0%"
+    ws["B5"].number_format = "0%"
+    ws["B6"].number_format = "0%"
+    ws["D5"].alignment = Alignment(horizontal="left")
+    ws["B3"].number_format = '0 "months"'
 
+    # Excel recalcula todas las fórmulas al abrir el archivo.
     try:
         wb.calculation.fullCalcOnLoad = True
         wb.calculation.forceFullCalc = True
@@ -496,111 +394,119 @@ def create_output(template_bytes: bytes, quote_rows: list[dict[str, Any]],
     except Exception:
         pass
 
-    out = io.BytesIO()
-    wb.save(out)
-    return out.getvalue()
+    output = io.BytesIO()
+    wb.save(output)
+    return output.getvalue()
 
 
 # ============================================================
-# INTERFAZ
+# STREAMLIT
 # ============================================================
 
 st.title("🌐 Cisco Price Manager")
-st.subheader("Calculadora Cisco en una sola hoja de Excel")
+st.subheader("Calculadora dinámica en una sola hoja")
 st.write(
-    "Carga la cotización de Cisco Commerce y tu plantilla. "
-    "La aplicación genera una única hoja llamada **Calculadora**, con los escenarios "
-    "de meses que indiques y la lista desplegable de países para aduanas."
+    "Carga la cotización de Cisco Commerce y la plantilla original. "
+    "El Excel generado conserva únicamente la hoja **Calculadora**. "
+    "En esa hoja podrás cambiar el país y el plazo desde listas desplegables."
 )
 
 with st.expander("Reglas de cálculo", expanded=False):
     st.markdown(
-        "- La tabla principal muestra únicamente los modelos de equipo de la calculadora original.\n"
-        "- Cada aparición del mismo SKU se conserva como un renglón independiente.\n"
-        "- Los accesorios, fuentes, memorias y licencias no se muestran como equipos.\n"
-        "- **Custom and Duties Cost = tasa del país × Equipment Cost** en cada renglón.\n"
-        "- NRC conserva el parámetro y las fórmulas de la plantilla; no tienes que multiplicarlo manualmente por 0.2.\n"
-        "- Las proyecciones de servicios se calculan según la duración indicada por Cisco."
+        "- **Equipment Cost:** suma el router y todos los componentes asociados, tangibles e intangibles.\n"
+        "- Solo los renglones de la cotización con un valor en **Service Duration (Months)** "
+        "se proyectan proporcionalmente al plazo seleccionado.\n"
+        "- Los componentes sin duración conservan su valor original.\n"
+        "- **Custom and Duties Cost:** tasa del país × precio físico del router, sin sumar licencias ni servicios.\n"
+        "- El NRC es editable en la aplicación y también en la celda B1 del Excel."
     )
 
-c1, c2 = st.columns(2)
-with c1:
-    quote_file = st.file_uploader("1. Cotización de Cisco Commerce (.xlsx)", type=["xlsx"])
-with c2:
-    template_file = st.file_uploader("2. Plantilla original de calculadora (.xlsx)", type=["xlsx"])
+left, right = st.columns(2)
+with left:
+    quote_file = st.file_uploader("1. Cotización Cisco Commerce (.xlsx)", type=["xlsx"])
+with right:
+    template_file = st.file_uploader("2. Plantilla original (.xlsx)", type=["xlsx"])
 
-st.markdown("### Parámetros")
-p1, p2, p3, p4 = st.columns(4)
+st.markdown("### Parámetros iniciales")
+p1, p2, p3 = st.columns(3)
 with p1:
-    months_raw = st.text_input("Plazos a proyectar (meses)", value="12,24,36,48",
-                               help="Escribe los plazos separados por comas. Ejemplo: 12,18,24,36.")
+    country = st.selectbox("País para aduanas", list(COUNTRY_RATES), index=list(COUNTRY_RATES).index("Belize"))
 with p2:
-    country = st.selectbox("País para aduanas", list(COUNTRY_RATES.keys()),
-                           index=list(COUNTRY_RATES.keys()).index("Belize"))
+    months = st.selectbox("Plazo inicial de proyección", [12, 24, 36, 48], index=0)
 with p3:
+    nrc_rate = st.number_input("NRC", min_value=0.0, max_value=1.0, value=0.20, step=0.01, format="%.2f")
+
+p4, p5, p6 = st.columns(3)
+with p4:
     shipping_per_equipment = st.number_input(
         "Shipping & Handling por equipo (USD)", min_value=0.0, value=500.0, step=50.0
     )
-with p4:
-    margin = st.number_input("Margin", min_value=0.0, max_value=0.95, value=0.20,
-                             step=0.01, format="%.2f")
-
-p5, p6 = st.columns(2)
 with p5:
-    return_rate = st.number_input("Return Rate", min_value=0.0, max_value=1.0,
-                                  value=0.10, step=0.01, format="%.2f")
+    margin = st.number_input("Margin", min_value=0.0, max_value=0.95, value=0.20, step=0.01, format="%.2f")
 with p6:
-    markup = st.number_input("Markup", min_value=0.0, max_value=5.0,
-                             value=0.10, step=0.01, format="%.2f")
+    return_rate = st.number_input("Return Rate", min_value=0.0, max_value=1.0, value=0.10, step=0.01, format="%.2f")
+
+markup = st.number_input("Markup", min_value=0.0, max_value=5.0, value=0.10, step=0.01, format="%.2f")
 
 if quote_file is not None:
     try:
-        preview_rows, meta = read_cisco_quote(quote_file.getvalue())
-        preview_equipment = identify_equipment(preview_rows)
-        st.markdown("### Equipos identificados")
-        st.metric("Renglones de equipos", len(preview_equipment))
+        preview_products, quote_meta = read_cisco_quote(quote_file.getvalue())
+        preview_groups = group_quote_by_equipment(preview_products)
+        st.markdown("### Vista previa de equipos")
+        st.metric("Equipos identificados", len(preview_groups))
         st.dataframe(
             [{
-                "Item": x["item"],
-                "Part Number Cisco": x["part_number"],
-                "Equipment Cost": x["equipment_cost"],
-                "Qty": x["quantity"],
-            } for x in preview_equipment],
+                "Equipo": g["part_number"] + (" (Secured)" if g["secured"] else ""),
+                "Equipment Cost (12 meses)": equipment_cost_at_term(g, 12),
+                "Base para aduanas": g["hardware_cost"],
+                "Componentes asociados": len(g["components"]),
+            } for g in preview_groups],
             use_container_width=True,
             hide_index=True,
         )
-        st.caption(f"Cotización detectada: hoja {meta['sheet']} · fila de encabezados {meta['header_row']}")
+        st.caption(
+            f"Cotización: hoja '{quote_meta['sheet']}' · "
+            f"fila de encabezados {quote_meta['header_row']} · "
+            f"{quote_meta['line_count']} renglones leídos."
+        )
     except Exception as exc:
         st.error(f"No pude leer la cotización: {exc}")
 
-if st.button("Generar Excel — una sola hoja", type="primary", use_container_width=True,
-             disabled=(quote_file is None or template_file is None)):
+if st.button(
+    "Generar calculadora Excel",
+    type="primary",
+    use_container_width=True,
+    disabled=(quote_file is None or template_file is None),
+):
     try:
-        months_list = parse_scenario_months(months_raw)
-        quote_rows, meta = read_cisco_quote(quote_file.getvalue())
+        quote_products, _ = read_cisco_quote(quote_file.getvalue())
+        groups = group_quote_by_equipment(quote_products)
         output_bytes = create_output(
             template_file.getvalue(),
-            quote_rows,
-            months_list,
+            quote_products,
             country,
+            months,
+            nrc_rate,
             shipping_per_equipment,
             margin,
             return_rate,
             markup,
         )
         filename = f"Cisco_Calculadora_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
-        st.success("Excel generado. El archivo contiene únicamente la hoja Calculadora.")
+        st.success("Calculadora generada correctamente. El archivo tiene una sola hoja.")
         st.download_button(
-            "Descargar calculadora Excel",
+            "Descargar Excel",
             data=output_bytes,
             file_name=filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
+        first_group = groups[0]
         st.info(
-            f"Escenarios incluidos en una sola hoja: {', '.join(str(x) for x in months_list)} meses. "
-            "En cada bloque puedes cambiar el país desde la lista desplegable; la tasa de aduanas "
-            "se actualiza automáticamente."
+            f"Verificación del primer equipo: {first_group['part_number']} — "
+            f"Equipment Cost a 12 meses: USD {equipment_cost_at_term(first_group, 12):,.2f}; "
+            f"base de aduanas: USD {first_group['hardware_cost']:,.2f}. "
+            "En Excel podrás cambiar el plazo en B3 y el país en D5."
         )
     except Exception as exc:
         st.error(f"No fue posible generar el Excel: {exc}")
